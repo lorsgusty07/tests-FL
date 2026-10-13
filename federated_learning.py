@@ -255,38 +255,54 @@ class CustomStrategy(fl.server.strategy.FedAvg):
         return loss_aggregated, {"accuracy": avg_accuracy, "network_mb": total_mb_round}
 
 
+class VocabWrapper:
+    """Clase envoltorio para objetos de vocabulario torchtext deserializados."""
+    def __init__(self, *args, **kwargs):
+        self.stoi = {}
+        self.itos = []
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            if "_stoi" in state:
+                self.stoi = state["_stoi"]
+            elif "stoi" in state:
+                self.stoi = state["stoi"]
+            else:
+                self.stoi = state
+        elif isinstance(state, (tuple, list)):
+            for item in state:
+                if isinstance(item, dict):
+                    self.stoi = item
+                    break
+                elif hasattr(item, "items"):
+                    self.stoi = dict(item)
+                    break
+        else:
+            self.stoi = {}
+    def __getitem__(self, token):
+        return self.stoi.get(token, 0)
+    def __len__(self):
+        return len(self.stoi)
+    def __contains__(self, token):
+        return token in self.stoi
+    def get_stoi(self):
+        return self.stoi
+
+
+class SafeUnpickler(pickle.Unpickler):
+    """Unpickler seguro que intercepta clases de torchtext para evitar ModuleNotFoundError."""
+    def find_class(self, module, name):
+        try:
+            return super().find_class(module, name)
+        except Exception:
+            if "torchtext" in module or "vocab" in module.lower():
+                return VocabWrapper
+            raise
+
+
 def load_vocab(vocab_path: str):
-    """Carga el vocabulario gestionando la dependencia de torchtext."""
-    try:
-        import torchtext
-    except ModuleNotFoundError:
-        import types
-        if "torchtext" not in sys.modules:
-            tt = types.ModuleType("torchtext")
-            sys.modules["torchtext"] = tt
-            tt_v = types.ModuleType("torchtext.vocab")
-            sys.modules["torchtext.vocab"] = tt_v
-
-            class VocabStub(dict):
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, **kwargs)
-                def __setstate__(self, state):
-                    if isinstance(state, tuple) and len(state) > 0 and isinstance(state[0], dict):
-                        self.update(state[0])
-                    elif isinstance(state, dict):
-                        self.update(state)
-                    elif hasattr(state, "__dict__"):
-                        self.update(state.__dict__)
-                def __getitem__(self, key):
-                    return super().get(key, 0)
-                def __contains__(self, key):
-                    return super().__contains__(key)
-
-            tt_v.Vocab = VocabStub
-            tt_v.vocab = VocabStub
-
+    """Carga el vocabulario con soporte universal independientemente de la versión de torchtext."""
     with open(vocab_path, "rb") as f:
-        return pickle.load(f)
+        return SafeUnpickler(f).load()
 
 
 # =====================================================================
