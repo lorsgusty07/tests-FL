@@ -130,6 +130,7 @@ def main(
     parser.add_argument("--model-type", type=str, choices=["hybrid", "cnn"], default="hybrid", help="Arquitectura del modelo ('hybrid' o 'cnn')")
     parser.add_argument("--no-freeze-transformers", action="store_true", help="No congelar las capas base de Transformers (por defecto están congeladas para eficiencia federada)")
     parser.add_argument("--max-seq-len", type=int, default=128, help="Longitud máxima de secuencia para los Transformers")
+    parser.add_argument("--batch-size", type=int, default=None, help="Tamaño de batch por cliente (por defecto 8 para hybrid, 32 para cnn)")
     parser.add_argument("--hf-token", type=str, default=os.getenv("HF_TOKEN", None), help="Token de autenticación de Hugging Face para modelos gated")
     parser.add_argument("--simulate-failures", action="store_true", help="Habilitar simulación de fallos aleatorios")
     parser.add_argument("--output-csv", type=str, default="tabla_precision_por_ronda.csv", help="Ruta para guardar tabla de precisión CSV")
@@ -259,7 +260,8 @@ def main(
             freeze_transformers=not args.no_freeze_transformers,
             shared_models=shared_models,
             max_seq_len=args.max_seq_len,
-            hf_token=hf_token
+            hf_token=hf_token,
+            batch_size=args.batch_size
         )
         return client.to_client() if hasattr(client, "to_client") else client
 
@@ -267,7 +269,7 @@ def main(
     strategy = CustomStrategy(client_fn=client_fn)
     client_resources = {
         "num_cpus": 1,
-        "num_gpus": 0.5 if torch.cuda.is_available() else 0.0
+        "num_gpus": 1.0 if torch.cuda.is_available() else 0.0
     }
 
     print(f"\n🚀 Iniciando simulación con {args.num_clients} clientes por {args.num_rounds} rondas...")
@@ -294,7 +296,8 @@ def main(
         freeze_transformers=not args.no_freeze_transformers,
         shared_models=shared_models,
         max_seq_len=args.max_seq_len,
-        hf_token=hf_token
+        hf_token=hf_token,
+        batch_size=args.batch_size
     )
     total_p, active_p, mb_round = test_client.get_dense_stats()
     total_transmision_mb = sum(strategy.history_network_mb)

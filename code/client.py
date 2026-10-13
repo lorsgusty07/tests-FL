@@ -26,7 +26,8 @@ class FlowerClient(fl.client.NumPyClient):
         freeze_transformers: bool = True,
         shared_models: dict = None,
         max_seq_len: int = 128,
-        hf_token: str = None
+        hf_token: str = None,
+        batch_size: int = None
     ):
         self.cid = int(cid)
         self.vocab = vocab
@@ -35,6 +36,11 @@ class FlowerClient(fl.client.NumPyClient):
         self.model_type = model_type
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.pad_idx = vocab['<pad>'] if '<pad>' in vocab else 0
+
+        if batch_size is not None and batch_size > 0:
+            self.batch_size = batch_size
+        else:
+            self.batch_size = 8 if model_type == "hybrid" else 32
 
         self.collate_fn = make_collate_fn(self.pad_idx)
         self.trainloader, self.valloader = self.load_data()
@@ -114,13 +120,13 @@ class FlowerClient(fl.client.NumPyClient):
         return (
             DataLoader(
                 TextDataset(texts[:split_idx], labels[:split_idx]),
-                batch_size=32,
+                batch_size=self.batch_size,
                 shuffle=True,
                 collate_fn=self.collate_fn
             ),
             DataLoader(
                 TextDataset(texts[split_idx:], labels[split_idx:]),
-                batch_size=64,
+                batch_size=self.batch_size,
                 shuffle=False,
                 collate_fn=self.collate_fn
             )
@@ -161,6 +167,9 @@ class FlowerClient(fl.client.NumPyClient):
                 total_samples += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         accuracy = correct / total_samples if total_samples > 0 else 0.0
         return self.get_parameters({}), len(self.trainloader.dataset), {"accuracy": accuracy, "failed": False}
 
@@ -176,6 +185,9 @@ class FlowerClient(fl.client.NumPyClient):
                 loss += self.criterion(outputs, labels).item() * labels.size(0)
                 total += labels.size(0)
                 correct += (outputs.argmax(1) == labels).sum().item()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         accuracy = correct / total if total > 0 else 0.0
         return float(loss / total), total, {"accuracy": accuracy}

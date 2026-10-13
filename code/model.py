@@ -267,9 +267,13 @@ class HybridTransformerClassifier(nn.Module):
         mental_inputs, mel_inputs = self._prepare_inputs(x)
 
         # Paso 1 y 2: Generar embeddings contextuales de 768 dimensiones
-        with torch.set_grad_enabled(not self.freeze_transformers):
-            emb_mental = self.mental_bert(**mental_inputs).last_hidden_state  # [B, L, 768]
-            emb_mel = self.melbert(**mel_inputs).last_hidden_state           # [B, L, 768]
+        if self.freeze_transformers:
+            with torch.no_grad():
+                emb_mental = self.mental_bert(**mental_inputs).last_hidden_state.detach()
+                emb_mel = self.melbert(**mel_inputs).last_hidden_state.detach()
+        else:
+            emb_mental = self.mental_bert(**mental_inputs).last_hidden_state
+            emb_mel = self.melbert(**mel_inputs).last_hidden_state
 
         # Paso 3: Módulos CNN-1D en cascada (768 -> 384 por rama)
         o_mental = self.cnn_mental(emb_mental)  # [B, 384]
