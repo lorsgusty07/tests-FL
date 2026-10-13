@@ -268,59 +268,18 @@ class CustomStrategy(fl.server.strategy.FedAvg):
         return loss_aggregated, {"accuracy": avg_accuracy, "network_mb": total_mb_round}
 
 
-class VocabWrapper:
-    """Clase envoltorio para objetos de vocabulario torchtext deserializados."""
-    def __init__(self, *args, **kwargs):
-        self.stoi = {}
-        self.itos = []
-        self._extract(args)
-    def _extract(self, obj):
-        if isinstance(obj, dict):
-            if "_stoi" in obj:
-                self.stoi.update(obj["_stoi"])
-            elif "stoi" in obj:
-                self.stoi.update(obj["stoi"])
-            else:
-                self.stoi.update(obj)
-        elif isinstance(obj, (list, tuple)):
-            for item in obj:
-                if isinstance(item, dict):
-                    self._extract(item)
-                elif isinstance(item, (list, tuple)):
-                    if len(item) > 0 and all(isinstance(x, str) for x in item[:10]):
-                        self.itos = list(item)
-                        self.stoi.update({tok: idx for idx, tok in enumerate(item)})
-                    else:
-                        self._extract(item)
-                elif hasattr(item, "items"):
-                    self.stoi.update(dict(item))
-    def __setstate__(self, state):
-        self._extract(state)
-    def __getitem__(self, token):
-        return self.stoi.get(token, 0)
-    def __len__(self):
-        return len(self.stoi)
-    def __contains__(self, token):
-        return token in self.stoi
-    def get_stoi(self):
-        return self.stoi
-
-
-class SafeUnpickler(pickle.Unpickler):
-    """Unpickler seguro que intercepta clases de torchtext para evitar ModuleNotFoundError."""
-    def find_class(self, module, name):
-        try:
-            return super().find_class(module, name)
-        except Exception:
-            if "torchtext" in module or "vocab" in module.lower():
-                return VocabWrapper
-            raise
-
-
 def load_vocab(vocab_path: str):
-    """Carga el vocabulario con soporte universal independientemente de la versión de torchtext."""
+    """Carga el vocabulario original usando torchtext tal como se hacía en el notebook."""
+    try:
+        import torchtext
+    except ModuleNotFoundError:
+        import subprocess
+        print("📦 torchtext no detectado. Instalando automáticamente para deserializar el vocabulario...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "torchtext"])
+        import torchtext
+
     with open(vocab_path, "rb") as f:
-        return SafeUnpickler(f).load()
+        return pickle.load(f)
 
 
 # =====================================================================
