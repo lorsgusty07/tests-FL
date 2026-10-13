@@ -81,7 +81,7 @@ class CNNTextClassifier(nn.Module):
 # =====================================================================
 class FlowerClient(fl.client.NumPyClient):
     """Cliente federado Flower para entrenamiento local y cálculo de tráfico de red."""
-    def __init__(self, cid: int, vocab: dict, classes: list, data_dir: str = None, simulate_failures: bool = False):
+    def __init__(self, cid: int, vocab: dict, classes: list, data_dir: str = None, simulate_failures: bool = False, vocab_size: int = None):
         self.cid = int(cid)
         self.vocab = vocab
         self.classes = classes
@@ -89,14 +89,27 @@ class FlowerClient(fl.client.NumPyClient):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.pad_idx = vocab['<pad>'] if '<pad>' in vocab else 0
 
+        self.collate_fn = make_collate_fn(self.pad_idx)
+        self.trainloader, self.valloader = self.load_data()
+
+        # Determinar el tamaño de vocabulario necesario para evitar IndexError
+        if vocab_size is not None and vocab_size > 0:
+            self.vocab_size = vocab_size
+        else:
+            max_tok = 0
+            for seq, _ in self.trainloader.dataset:
+                if len(seq) > 0:
+                    m = int(seq.max())
+                    if m > max_tok:
+                        max_tok = m
+            self.vocab_size = max(len(self.vocab), max_tok + 1)
+
         self.model = CNNTextClassifier(
-            vocab_size=len(self.vocab),
+            vocab_size=self.vocab_size,
             num_classes=len(self.classes),
             pad_idx=self.pad_idx
         ).to(self.device)
 
-        self.collate_fn = make_collate_fn(self.pad_idx)
-        self.trainloader, self.valloader = self.load_data()
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
         self.criterion = nn.CrossEntropyLoss()
         self.simulate_failures = simulate_failures
@@ -260,24 +273,29 @@ class VocabWrapper:
     def __init__(self, *args, **kwargs):
         self.stoi = {}
         self.itos = []
-    def __setstate__(self, state):
-        if isinstance(state, dict):
-            if "_stoi" in state:
-                self.stoi = state["_stoi"]
-            elif "stoi" in state:
-                self.stoi = state["stoi"]
+        self._extract(args)
+    def _extract(self, obj):
+        if isinstance(obj, dict):
+            if "_stoi" in obj:
+                self.stoi.update(obj["_stoi"])
+            elif "stoi" in obj:
+                self.stoi.update(obj["stoi"])
             else:
-                self.stoi = state
-        elif isinstance(state, (tuple, list)):
-            for item in state:
+                self.stoi.update(obj)
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
                 if isinstance(item, dict):
-                    self.stoi = item
-                    break
+                    self._extract(item)
+                elif isinstance(item, (list, tuple)):
+                    if len(item) > 0 and all(isinstance(x, str) for x in item[:10]):
+                        self.itos = list(item)
+                        self.stoi.update({tok: idx for idx, tok in enumerate(item)})
+                    else:
+                        self._extract(item)
                 elif hasattr(item, "items"):
-                    self.stoi = dict(item)
-                    break
-        else:
-            self.stoi = {}
+                    self.stoi.update(dict(item))
+    def __setstate__(self, state):
+        self._extract(state)
     def __getitem__(self, token):
         return self.stoi.get(token, 0)
     def __len__(self):
@@ -404,7 +422,22 @@ def run_federated_learning(
     vocab = load_vocab(vocab_path)
 
     classes = label_metadata["classes"].tolist()
+
+    # Calcular vocab_size global seguro verificando tokens en los clientes
+    global_vocab_size = len(vocab)
+    for cid in range(args.num_clients):
+        c_path = find_file(f"client_{cid}.npz")
+        if os.path.exists(c_path):
+            data_c = np.load(c_path, allow_pickle=True)
+            if "texts" in data_c:
+                for seq in data_c["texts"]:
+                    if len(seq) > 0:
+                        m = int(np.max(seq))
+                        if m >= global_vocab_size:
+                            global_vocab_size = m + 1
+
     print(f"✅ Vocabulario cargado ({len(vocab)} tokens). Clases detectadas: {len(classes)}")
+    print(f"📊 Tamaño efectivo del vocabulario para la CNN: {global_vocab_size}")
 
     # Función generadora de cliente
     def client_fn(cid: str):
@@ -413,7 +446,8 @@ def run_federated_learning(
             vocab=vocab,
             classes=classes,
             data_dir=args.data_dir,
-            simulate_failures=args.simulate_failures
+            simulate_failures=args.simulate_failures,
+            vocab_size=global_vocab_size
         )
         return client.to_client() if hasattr(client, "to_client") else client
 
@@ -438,7 +472,7 @@ def run_federated_learning(
     print("📡 MÉTRICAS DE RED: MODELO DENSO (BASELINE)".center(50))
     print("=" * 50)
 
-    test_client = FlowerClient(0, vocab=vocab, classes=classes, data_dir=args.data_dir)
+    test_client = FlowerClient(0, vocab=vocab, classes=classes, data_dir=args.data_dir, vocab_size=global_vocab_size)
     total_p, active_p, mb_round = test_client.get_dense_stats()
     total_transmision_mb = sum(strategy.history_network_mb)
 

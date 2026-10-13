@@ -14,7 +14,7 @@ class FlowerClient(fl.client.NumPyClient):
     Cliente federado basado en la celda 11 del notebook Aprendizaje_Federado.ipynb.
     Maneja el entrenamiento y evaluación local con CNNTextClassifier.
     """
-    def __init__(self, cid: int, vocab: dict, classes: list, data_dir: str = None, simulate_failures: bool = False):
+    def __init__(self, cid: int, vocab: dict, classes: list, data_dir: str = None, simulate_failures: bool = False, vocab_size: int = None):
         self.cid = int(cid)
         self.vocab = vocab
         self.classes = classes
@@ -22,14 +22,27 @@ class FlowerClient(fl.client.NumPyClient):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.pad_idx = vocab['<pad>'] if '<pad>' in vocab else 0
 
+        self.collate_fn = make_collate_fn(self.pad_idx)
+        self.trainloader, self.valloader = self.load_data()
+
+        # Determinar el tamaño de vocabulario necesario para evitar IndexError
+        if vocab_size is not None and vocab_size > 0:
+            self.vocab_size = vocab_size
+        else:
+            max_tok = 0
+            for seq, _ in self.trainloader.dataset:
+                if len(seq) > 0:
+                    m = int(seq.max())
+                    if m > max_tok:
+                        max_tok = m
+            self.vocab_size = max(len(self.vocab), max_tok + 1)
+
         self.model = CNNTextClassifier(
-            vocab_size=len(self.vocab),
+            vocab_size=self.vocab_size,
             num_classes=len(self.classes),
             pad_idx=self.pad_idx
         ).to(self.device)
 
-        self.collate_fn = make_collate_fn(self.pad_idx)
-        self.trainloader, self.valloader = self.load_data()
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
         self.criterion = nn.CrossEntropyLoss()
         self.simulate_failures = simulate_failures

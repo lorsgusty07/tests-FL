@@ -37,24 +37,29 @@ class VocabWrapper:
     def __init__(self, *args, **kwargs):
         self.stoi = {}
         self.itos = []
-    def __setstate__(self, state):
-        if isinstance(state, dict):
-            if "_stoi" in state:
-                self.stoi = state["_stoi"]
-            elif "stoi" in state:
-                self.stoi = state["stoi"]
+        self._extract(args)
+    def _extract(self, obj):
+        if isinstance(obj, dict):
+            if "_stoi" in obj:
+                self.stoi.update(obj["_stoi"])
+            elif "stoi" in obj:
+                self.stoi.update(obj["stoi"])
             else:
-                self.stoi = state
-        elif isinstance(state, (tuple, list)):
-            for item in state:
+                self.stoi.update(obj)
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
                 if isinstance(item, dict):
-                    self.stoi = item
-                    break
+                    self._extract(item)
+                elif isinstance(item, (list, tuple)):
+                    if len(item) > 0 and all(isinstance(x, str) for x in item[:10]):
+                        self.itos = list(item)
+                        self.stoi.update({tok: idx for idx, tok in enumerate(item)})
+                    else:
+                        self._extract(item)
                 elif hasattr(item, "items"):
-                    self.stoi = dict(item)
-                    break
-        else:
-            self.stoi = {}
+                    self.stoi.update(dict(item))
+    def __setstate__(self, state):
+        self._extract(state)
     def __getitem__(self, token):
         return self.stoi.get(token, 0)
     def __len__(self):
@@ -164,16 +169,32 @@ def main(
     vocab = load_vocab(vocab_path)
 
     classes = label_metadata["classes"].tolist()
-    print(f"✅ Vocabulario cargado ({len(vocab)} tokens). Clases: {len(classes)} ({classes})")
 
-    # 2. Función generadora de clientes (Celda 12)
+    # 2. Calcular vocab_size global seguro verificando tokens en los clientes
+    global_vocab_size = len(vocab)
+    for cid in range(args.num_clients):
+        c_path = resolve_file(args.data_dir, f"client_{cid}.npz")
+        if os.path.exists(c_path):
+            data_c = np.load(c_path, allow_pickle=True)
+            if "texts" in data_c:
+                for seq in data_c["texts"]:
+                    if len(seq) > 0:
+                        m = int(np.max(seq))
+                        if m >= global_vocab_size:
+                            global_vocab_size = m + 1
+
+    print(f"✅ Vocabulario cargado ({len(vocab)} tokens). Clases: {len(classes)} ({classes})")
+    print(f"📊 Tamaño efectivo del vocabulario para la CNN: {global_vocab_size}")
+
+    # 3. Función generadora de clientes (Celda 12)
     def client_fn(cid: str):
         client = FlowerClient(
             cid=int(cid),
             vocab=vocab,
             classes=classes,
             data_dir=args.data_dir,
-            simulate_failures=args.simulate_failures
+            simulate_failures=args.simulate_failures,
+            vocab_size=global_vocab_size
         )
         return client.to_client() if hasattr(client, "to_client") else client
 
@@ -198,7 +219,7 @@ def main(
     print("📡 MÉTRICAS DE RED: MODELO DENSO (BASELINE)".center(50))
     print("=" * 50)
 
-    test_client = FlowerClient(0, vocab=vocab, classes=classes, data_dir=args.data_dir)
+    test_client = FlowerClient(0, vocab=vocab, classes=classes, data_dir=args.data_dir, vocab_size=global_vocab_size)
     total_p, active_p, mb_round = test_client.get_dense_stats()
     total_transmision_mb = sum(strategy.history_network_mb)
 
