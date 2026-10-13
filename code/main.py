@@ -32,18 +32,81 @@ def resolve_file(base_dir: str, filename: str) -> str:
     return candidates[0]
 
 
-def load_vocab(vocab_path: str):
-    """Carga el vocabulario original usando torchtext tal como se hacía en el notebook."""
-    try:
-        import torchtext
-    except ModuleNotFoundError:
-        import subprocess
-        print("📦 torchtext no detectado. Instalando automáticamente para deserializar el vocabulario...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "torchtext"])
-        import torchtext
+class LegacyVocab:
+    """Estructura de vocabulario retrocompatible para deserializar vocabularios de torchtext legacy."""
+    def __new__(cls, *args, **kwargs):
+        inst = super().__new__(cls)
+        inst.stoi = {}
+        inst.itos = []
+        return inst
 
+    def __init__(self, *args, **kwargs):
+        self.stoi = {}
+        self.itos = []
+        if args:
+            self._extract(args)
+
+    def _extract(self, obj):
+        if isinstance(obj, dict):
+            if "stoi" in obj:
+                self.stoi.update(obj["stoi"])
+            elif "_stoi" in obj:
+                self.stoi.update(obj["_stoi"])
+            else:
+                self.stoi.update(obj)
+            if "itos" in obj:
+                self.itos = list(obj["itos"])
+            elif "_itos" in obj:
+                self.itos = list(obj["_itos"])
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                self._extract(item)
+        elif hasattr(obj, "__dict__"):
+            self._extract(obj.__dict__)
+
+    def __setstate__(self, state):
+        self.stoi = {}
+        self.itos = []
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+            self._extract(state)
+        elif isinstance(state, (list, tuple)):
+            self._extract(state)
+        if not self.stoi and self.itos:
+            self.stoi = {tok: idx for idx, tok in enumerate(self.itos)}
+
+    def __getitem__(self, token):
+        return self.stoi.get(token, self.stoi.get("<unk>", 0))
+
+    def __len__(self):
+        return len(self.stoi) if self.stoi else len(self.itos)
+
+    def __contains__(self, token):
+        return token in self.stoi
+
+    def get_stoi(self):
+        return self.stoi
+
+    def get_itos(self):
+        return self.itos
+
+
+class RobustUnpickler(pickle.Unpickler):
+    """Unpickler tolerante que intercepta referencias legacy a torchtext.vocab.vocab."""
+    def find_class(self, module, name):
+        if "torchtext" in module or "vocab" in module.lower():
+            return LegacyVocab
+        return super().find_class(module, name)
+
+
+def load_vocab(vocab_path: str):
+    """Carga el vocabulario con soporte nativo y fallback robusto para cualquier versión de torchtext."""
     with open(vocab_path, "rb") as f:
-        return pickle.load(f)
+        try:
+            return pickle.load(f)
+        except Exception:
+            f.seek(0)
+            return RobustUnpickler(f).load()
 
 
 def main(
