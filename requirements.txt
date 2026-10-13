@@ -10,6 +10,7 @@ ipywidgets>=8.0.0
 # 3. Ecosistema PyTorch (aprovecha la versión CUDA preinstalada en Colab)
 torch>=2.2.0
 torchvision>=0.17.0
+torchtext
 
 # 4. Manipulación de datos y utilidades
 numpy

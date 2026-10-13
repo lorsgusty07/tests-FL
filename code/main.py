@@ -32,6 +32,41 @@ def resolve_file(base_dir: str, filename: str) -> str:
     return candidates[0]
 
 
+def load_vocab(vocab_path: str):
+    """Carga el vocabulario gestionando la dependencia de torchtext."""
+    try:
+        import torchtext
+    except ModuleNotFoundError:
+        import types
+        # Stub de compatibilidad por si torchtext no está instalado en el entorno
+        if "torchtext" not in sys.modules:
+            tt = types.ModuleType("torchtext")
+            sys.modules["torchtext"] = tt
+            tt_v = types.ModuleType("torchtext.vocab")
+            sys.modules["torchtext.vocab"] = tt_v
+
+            class VocabStub(dict):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                def __setstate__(self, state):
+                    if isinstance(state, tuple) and len(state) > 0 and isinstance(state[0], dict):
+                        self.update(state[0])
+                    elif isinstance(state, dict):
+                        self.update(state)
+                    elif hasattr(state, "__dict__"):
+                        self.update(state.__dict__)
+                def __getitem__(self, key):
+                    return super().get(key, 0)
+                def __contains__(self, key):
+                    return super().__contains__(key)
+
+            tt_v.Vocab = VocabStub
+            tt_v.vocab = VocabStub
+
+    with open(vocab_path, "rb") as f:
+        return pickle.load(f)
+
+
 def main(
     data_dir: str = None,
     num_clients: int = None,
@@ -111,8 +146,7 @@ def main(
 
     print(f"📂 Cargando metadatos desde: {metadata_path}")
     label_metadata = np.load(metadata_path, allow_pickle=True)
-    with open(vocab_path, "rb") as f:
-        vocab = pickle.load(f)
+    vocab = load_vocab(vocab_path)
 
     classes = label_metadata["classes"].tolist()
     print(f"✅ Vocabulario cargado ({len(vocab)} tokens). Clases: {len(classes)} ({classes})")
