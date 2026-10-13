@@ -33,8 +33,13 @@ def resolve_file(base_dir: str, filename: str) -> str:
 
 
 def main():
+    default_data_dir = (
+        "/content/drive/My Drive/federated_text_data"
+        if os.path.exists("/content/drive/My Drive/federated_text_data")
+        else "./dataset/federated_text_data"
+    )
     parser = argparse.ArgumentParser(description="Ejecución de Aprendizaje Federado (PyTorch + Flower)")
-    parser.add_argument("--data-dir", type=str, default="./dataset/federated_text_data", help="Directorio con datos federados")
+    parser.add_argument("--data-dir", type=str, default=default_data_dir, help="Directorio con datos federados")
     parser.add_argument("--num-clients", type=int, default=5, help="Número de clientes federados")
     parser.add_argument("--num-rounds", type=int, default=10, help="Número de rondas de comunicación")
     parser.add_argument("--simulate-failures", action="store_true", help="Habilitar simulación de fallos aleatorios")

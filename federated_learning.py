@@ -259,8 +259,13 @@ class CustomStrategy(fl.server.strategy.FedAvg):
 # 4. Orquestación y Ejecución de la Simulación (Celdas 9, 12, 13, 14)
 # =====================================================================
 def run_federated_learning():
+    default_data_dir = (
+        "/content/drive/My Drive/federated_text_data"
+        if os.path.exists("/content/drive/My Drive/federated_text_data")
+        else "./dataset/federated_text_data"
+    )
     parser = argparse.ArgumentParser(description="Simulación de Aprendizaje Federado")
-    parser.add_argument("--data-dir", type=str, default="./dataset/federated_text_data", help="Ruta a los datos federados")
+    parser.add_argument("--data-dir", type=str, default=default_data_dir, help="Ruta a los datos federados")
     parser.add_argument("--num-clients", type=int, default=5, help="Número de clientes")
     parser.add_argument("--num-rounds", type=int, default=10, help="Rondas de federación")
     parser.add_argument("--simulate-failures", action="store_true", help="Simular clientes con fallo")
