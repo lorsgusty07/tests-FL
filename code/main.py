@@ -252,6 +252,8 @@ def main(
     parser.add_argument("--output-plot", type=str, default="evolucion_rendimiento.png", help="Ruta para guardar gráfica de evolución")
     parser.add_argument("--mock-data", action="store_true", help="Generar datos sintéticos para probar la ejecución sin archivos reales")
     parser.add_argument("--no-ray", action="store_true", help="Ejecutar FedAvg secuencial en un solo proceso, sin Ray (muestra el error real si algo falla y evita que el worker muera por memoria)")
+    parser.add_argument("--skip-preflight", action="store_true", help="Omitir la prueba previa de 1 cliente en un subproceso aislado")
+    parser.add_argument("--preflight-child", action="store_true", help=argparse.SUPPRESS)
     args, _ = parser.parse_known_args()
 
     # Si se invocó como función Python con parámetros, sobrescribir:
@@ -384,25 +386,59 @@ def main(
         "num_gpus": 1.0 if torch.cuda.is_available() else 0.0
     }
 
+    def build_numpy_client(cid: int):
+        return FlowerClient(
+            cid=int(cid),
+            vocab=vocab,
+            classes=classes,
+            data_dir=args.data_dir,
+            simulate_failures=args.simulate_failures,
+            vocab_size=global_vocab_size,
+            model_type=args.model_type,
+            freeze_transformers=not args.no_freeze_transformers,
+            shared_models=None,
+            max_seq_len=args.max_seq_len,
+            hf_token=hf_token,
+            batch_size=args.batch_size
+        )
+
+    # Modo hijo del preflight: ejecuta 1 cliente real (2 batches) y termina
+    if args.preflight_child:
+        print("🧪 [preflight] construyendo cliente 0 y ejecutando 2 batches...", flush=True)
+        c = build_numpy_client(0)
+        p = c.get_parameters({})
+        c.fit(p, {"max_batches": 2})
+        c.evaluate(p, {})
+        print("✅ PREFLIGHT OK: el pipeline completo funciona en un proceso aislado.", flush=True)
+        return
+
+    # Preflight: si el proceso muere aquí, se ve la causa real (en vez de la cascada de Ray)
+    if (not args.no_ray and not args.skip_preflight and args.model_type == "hybrid"
+            and os.path.basename(sys.argv[0]) == "main.py"):
+        import subprocess
+        print("\n🧪 Preflight: probando 1 cliente en un subproceso aislado antes de lanzar Ray...", flush=True)
+        cmd = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:] + ["--preflight-child"]
+        rc = subprocess.run(cmd).returncode
+        if rc != 0:
+            causas = {
+                -9: "SIGKILL: el sistema mató el proceso por FALTA DE RAM (OOM). Reduce --batch-size/--max-seq-len o usa un runtime con más memoria.",
+                137: "SIGKILL: el sistema mató el proceso por FALTA DE RAM (OOM). Reduce --batch-size/--max-seq-len o usa un runtime con más memoria.",
+                -11: "SIGSEGV: fallo nativo (segfault) en una librería (torch/transformers/tokenizers/CUDA).",
+                139: "SIGSEGV: fallo nativo (segfault) en una librería (torch/transformers/tokenizers/CUDA).",
+                -6: "SIGABRT: abort nativo (suele ser CUDA/driver o una aserción de librería).",
+                134: "SIGABRT: abort nativo (suele ser CUDA/driver o una aserción de librería).",
+            }
+            print("\n" + "=" * 60)
+            print(f"❌ PREFLIGHT FALLÓ (código de salida {rc}).")
+            print(f"   Causa probable: {causas.get(rc, 'excepción de Python; revisa el traceback impreso arriba.')}")
+            print("   Se aborta antes de lanzar Ray para no inundar la consola con 'ActorPool is empty'.")
+            print("   Pega las líneas '[diag ...]' y el traceback de arriba para localizar el punto exacto.")
+            print("=" * 60)
+            sys.exit(1)
+        print("✅ Preflight correcto. Lanzando la simulación con Ray...\n", flush=True)
+
     if args.no_ray:
         print(f"\n🚀 Iniciando FedAvg SECUENCIAL (sin Ray) con {args.num_clients} clientes por {args.num_rounds} rondas...")
-
-        def build_numpy_client(cid: int):
-            return FlowerClient(
-                cid=int(cid),
-                vocab=vocab,
-                classes=classes,
-                data_dir=args.data_dir,
-                simulate_failures=args.simulate_failures,
-                vocab_size=global_vocab_size,
-                model_type=args.model_type,
-                freeze_transformers=not args.no_freeze_transformers,
-                shared_models=None,
-                max_seq_len=args.max_seq_len,
-                hf_token=hf_token,
-                batch_size=args.batch_size
-            )
-
         run_sequential(build_numpy_client, strategy, args.num_clients, args.num_rounds)
     else:
         print(f"\n🚀 Iniciando simulación con {args.num_clients} clientes por {args.num_rounds} rondas...")

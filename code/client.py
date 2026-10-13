@@ -183,8 +183,10 @@ class FlowerClient(fl.client.NumPyClient):
         self.set_parameters(parameters)
         _diag(f"cliente {self.cid}: fit() inicio ({len(self.trainloader.dataset)} muestras, batch={self.batch_size})")
 
+        max_batches = config.get("max_batches") if config else None
         total_samples = 0
         correct = 0
+        done = 0
         self.model.train()
         for epoch in range(3):
             for step, (texts, labels) in enumerate(self.trainloader):
@@ -200,6 +202,11 @@ class FlowerClient(fl.client.NumPyClient):
                 correct += (predicted == labels).sum().item()
                 if epoch == 0 and step == 0:
                     _diag(f"cliente {self.cid}: primer batch OK (loss={loss.item():.4f})")
+                done += 1
+                if max_batches is not None and done >= int(max_batches):
+                    break
+            if max_batches is not None and done >= int(max_batches):
+                break
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
