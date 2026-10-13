@@ -106,6 +106,45 @@ class CascadedCNN1DBlock(nn.Module):
         return out
 
 
+def load_melbert_base(model_name_or_path: str = "EhsanAghazadeh/melbert-roberta", token: str = None):
+    """
+    Carga MelBERT adaptando el prefijo 'encoder.' del checkpoint original para que
+    todas las 12 capas preentrenadas de RoBERTa y sus embeddings se carguen al 100%,
+    evitando que queden sin inicializar (MISSING).
+    """
+    from transformers import AutoModel, AutoConfig
+    from transformers.utils import cached_file
+    import torch
+
+    config = AutoConfig.from_pretrained(model_name_or_path, token=token)
+    model = AutoModel.from_config(config)
+
+    state_dict = None
+    try:
+        from safetensors.torch import load_file
+        sf_path = cached_file(model_name_or_path, "model.safetensors", token=token)
+        if sf_path:
+            state_dict = load_file(sf_path)
+    except Exception:
+        pass
+
+    if state_dict is None:
+        bin_path = cached_file(model_name_or_path, "pytorch_model.bin", token=token)
+        state_dict = torch.load(bin_path, map_location="cpu")
+
+    # El checkpoint original de MelBERT tiene los pesos de RoBERTa bajo el prefijo 'encoder.'
+    clean_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("encoder."):
+            clean_k = k[len("encoder."):]
+            clean_state_dict[clean_k] = v
+        elif not any(k.startswith(p) for p in ["MIP_", "SPV_", "classifier."]):
+            clean_state_dict[k] = v
+
+    model.load_state_dict(clean_state_dict, strict=False)
+    return model
+
+
 class HybridTransformerClassifier(nn.Module):
     """
     Modelo Híbrido Transformer + CNN-1D en Cascada para Clasificación en Ambiente Federado:
@@ -153,9 +192,9 @@ class HybridTransformerClassifier(nn.Module):
             self.melbert = melbert_model
             self.mel_tokenizer = mel_tokenizer
         else:
-            from transformers import AutoModel, AutoTokenizer
+            from transformers import AutoTokenizer
             self.mel_tokenizer = AutoTokenizer.from_pretrained(melbert_model_name, token=hf_token)
-            self.melbert = AutoModel.from_pretrained(melbert_model_name, token=hf_token)
+            self.melbert = load_melbert_base(melbert_model_name, token=hf_token)
 
         # Si se congelan los transformers, no computan gradientes en clientes federados
         if self.freeze_transformers:

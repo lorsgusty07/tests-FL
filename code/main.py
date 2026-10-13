@@ -236,14 +236,15 @@ def main(
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "transformers", "accelerate"])
             from transformers import AutoModel, AutoTokenizer
 
+        from model import load_melbert_base
         print("⏳ Pre-cargando modelos Transformer base (MentalBERT & MelBERT)...")
         mental_name = "mental/mental-bert-base-uncased"
         mel_name = "EhsanAghazadeh/melbert-roberta"
         shared_models["mental_tokenizer"] = AutoTokenizer.from_pretrained(mental_name, token=hf_token)
         shared_models["mental_model"] = AutoModel.from_pretrained(mental_name, token=hf_token)
         shared_models["mel_tokenizer"] = AutoTokenizer.from_pretrained(mel_name, token=hf_token)
-        shared_models["melbert_model"] = AutoModel.from_pretrained(mel_name, token=hf_token)
-        print("✅ Modelos base MentalBERT y MelBERT cargados exitosamente.")
+        shared_models["melbert_model"] = load_melbert_base(mel_name, token=hf_token)
+        print("✅ Modelos base MentalBERT y MelBERT cargados exitosamente (pesos 100% restaurados).")
 
     # 3. Función generadora de clientes (Celda 12)
     def client_fn(cid: str):
