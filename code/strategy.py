@@ -16,11 +16,21 @@ class CustomStrategy(fl.server.strategy.FedAvg):
         self.best_model = None
         self.history_accuracy = []
         self.history_network_mb = []
+        # Peso real (MB) de los parámetros que envía un cliente, medido en aggregate_fit
+        self.payload_mb_per_client = 0.0
+        self.payload_params_per_client = 0
 
     def aggregate_fit(self, server_round, results, failures):
         # Filtrar clientes fallidos
         valid_results = [r for r in results if not r[1].metrics.get("failed", False)]
         accuracies = [res.metrics["accuracy"] for _, res in valid_results if "accuracy" in res.metrics]
+
+        # Medir el payload real que viaja por la red (bytes de los tensores serializados)
+        if valid_results:
+            first_params = valid_results[0][1].parameters
+            payload_bytes = sum(len(t) for t in first_params.tensors)
+            self.payload_mb_per_client = payload_bytes / (1024 ** 2)
+            self.payload_params_per_client = payload_bytes // 4  # float32
 
         if accuracies:
             best_idx = np.argmax(accuracies)
@@ -46,18 +56,13 @@ class CustomStrategy(fl.server.strategy.FedAvg):
         avg_accuracy = float(np.mean(accuracies)) if accuracies else 0.0
         self.history_accuracy.append(avg_accuracy)
 
-        # 2. CÁLCULO DE RED REAL (DENSO)
-        # Obtenemos un cliente de prueba para medir el peso total del modelo
+        # 2. CÁLCULO DE RED REAL
+        # Se usa el peso real medido en aggregate_fit (no se instancia ningún modelo en el driver)
         total_mb_round = 0.0
-        if self.client_fn is not None:
-            test_client = self.client_fn("0")
-            # En caso de que client_fn devuelva un wrapper de Flower o el NumPyClient
-            underlying_client = getattr(test_client, "numpy_client", test_client)
-            if hasattr(underlying_client, "get_dense_stats"):
-                _, _, mb_per_client = underlying_client.get_dense_stats()
-                # Tráfico: Clientes que respondieron * peso total * 2 (ida y vuelta)
-                total_mb_round = len(results) * mb_per_client * 2
-                self.history_network_mb.append(total_mb_round)
+        if self.payload_mb_per_client > 0:
+            # Tráfico: Clientes que respondieron * peso comunicado * 2 (ida y vuelta)
+            total_mb_round = len(results) * self.payload_mb_per_client * 2
+            self.history_network_mb.append(total_mb_round)
 
         # 3. Log para consola
         print(f"--- Ronda {server_round} ---")

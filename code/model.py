@@ -296,6 +296,14 @@ class HybridTransformerClassifier(nn.Module):
         self.classifier = nn.Linear(128, num_classes)
         self.softmax = nn.Softmax(dim=1)
 
+    def train(self, mode: bool = True):
+        """Los transformers congelados siempre permanecen en eval() (sin dropout)."""
+        super().train(mode)
+        if self.freeze_transformers:
+            self.mental_bert.eval()
+            self.melbert.eval()
+        return self
+
     def _prepare_inputs(self, x):
         """Convierte entradas (textos o tensores de IDs) en inputs listos para MentalBERT y MelBERT."""
         device = next(self.parameters()).device

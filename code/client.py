@@ -1,4 +1,6 @@
 import os
+import sys
+import faulthandler
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,6 +15,29 @@ from model import (
     make_collate_fn,
     extract_itos,
 )
+
+# Si el proceso muere por un fallo nativo (SIGSEGV/SIGABRT) imprime el traceback de Python
+try:
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+except Exception:
+    pass
+
+
+def _diag(msg: str):
+    """Log de diagnóstico con RAM del proceso y memoria GPU; siempre con flush."""
+    parts = [f"[diag pid={os.getpid()}] {msg}"]
+    try:
+        import psutil
+        parts.append(f"RAM_proc={psutil.Process().memory_info().rss / 1024**3:.2f}GB")
+        parts.append(f"RAM_libre={psutil.virtual_memory().available / 1024**3:.2f}GB")
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        try:
+            parts.append(f"GPU_alloc={torch.cuda.memory_allocated() / 1024**3:.2f}GB")
+        except Exception:
+            pass
+    print(" | ".join(parts), flush=True)
 
 
 class FlowerClient(fl.client.NumPyClient):
@@ -65,6 +90,7 @@ class FlowerClient(fl.client.NumPyClient):
 
         if model_type == "hybrid":
             vocab_itos = extract_itos(self.vocab)
+            _diag(f"cliente {self.cid}: datos listos, vocab_itos={'None' if vocab_itos is None else len(vocab_itos)}; cargando backbones...")
 
             self.model = HybridTransformerClassifier(
                 num_classes=len(self.classes),
@@ -77,7 +103,10 @@ class FlowerClient(fl.client.NumPyClient):
                 mental_tokenizer=shared_models.get("mental_tokenizer") if shared_models else None,
                 mel_tokenizer=shared_models.get("mel_tokenizer") if shared_models else None,
                 hf_token=hf_token
-            ).to(self.device)
+            )
+            _diag(f"cliente {self.cid}: backbones cargados en CPU; moviendo a {self.device}...")
+            self.model = self.model.to(self.device)
+            _diag(f"cliente {self.cid}: modelo en {self.device}")
 
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
             self.optimizer = optim.Adam(trainable_params, lr=1e-4)
@@ -152,12 +181,13 @@ class FlowerClient(fl.client.NumPyClient):
             return self.get_parameters({}), 0, {"accuracy": 0.0, "failed": True}
 
         self.set_parameters(parameters)
+        _diag(f"cliente {self.cid}: fit() inicio ({len(self.trainloader.dataset)} muestras, batch={self.batch_size})")
 
         total_samples = 0
         correct = 0
         self.model.train()
-        for _ in range(3):
-            for texts, labels in self.trainloader:
+        for epoch in range(3):
+            for step, (texts, labels) in enumerate(self.trainloader):
                 texts, labels = texts.to(self.device), labels.to(self.device)
                 self.optimizer.zero_grad()
                 outputs = self.model(texts)
@@ -168,11 +198,14 @@ class FlowerClient(fl.client.NumPyClient):
                 _, predicted = torch.max(outputs.data, 1)
                 total_samples += labels.size(0)
                 correct += (predicted == labels).sum().item()
+                if epoch == 0 and step == 0:
+                    _diag(f"cliente {self.cid}: primer batch OK (loss={loss.item():.4f})")
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         accuracy = correct / total_samples if total_samples > 0 else 0.0
+        _diag(f"cliente {self.cid}: fit() fin (acc={accuracy:.2%})")
         return self.get_parameters({}), len(self.trainloader.dataset), {"accuracy": accuracy, "failed": False}
 
     def evaluate(self, parameters, config):

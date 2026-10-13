@@ -143,6 +143,87 @@ def load_vocab(vocab_path: str):
             return RobustUnpickler(f).load()
 
 
+def count_backbone_params(hf_token: str = None) -> int:
+    """Cuenta los parámetros de MentalBERT + MelBERT en el dispositivo 'meta' (sin reservar memoria)."""
+    try:
+        from transformers import AutoConfig, AutoModel
+        total = 0
+        for name in ("mental/mental-bert-base-uncased", "EhsanAghazadeh/melbert-roberta"):
+            cfg = AutoConfig.from_pretrained(name, token=hf_token)
+            with torch.device("meta"):
+                m = AutoModel.from_config(cfg)
+            total += sum(p.numel() for p in m.parameters())
+        return total
+    except Exception as e:
+        print(f"⚠️ No se pudo contar los parámetros de los backbones: {e}")
+        return 0
+
+
+def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
+    """
+    FedAvg en un único proceso (sin Ray): cada cliente se entrena uno tras otro y los
+    pesos se promedian ponderando por número de muestras (igual que FedAvg de Flower).
+    Cualquier error aparece con su traceback real en lugar de 'ActorPool is empty'.
+    """
+    import gc
+    from flwr.server.strategy.aggregate import aggregate
+
+    global_params = build_client(0).get_parameters({})
+
+    for rnd in range(1, num_rounds + 1):
+        print(f"\n[ROUND {rnd}]", flush=True)
+
+        fit_results, fit_accs, payload_bytes = [], [], 0
+        for cid in range(num_clients):
+            client = build_client(cid)
+            new_params, n_samples, metrics = client.fit(global_params, {})
+            if metrics.get("failed", False) or n_samples == 0:
+                print(f"⚠️ Cliente {cid} reportó fallo; se omite en la agregación.", flush=True)
+            else:
+                fit_results.append((new_params, n_samples))
+                fit_accs.append(metrics["accuracy"])
+                payload_bytes = sum(p.nbytes for p in new_params)
+            del client
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if not fit_results:
+            raise RuntimeError("Ningún cliente devolvió resultados válidos en esta ronda.")
+
+        global_params = aggregate(fit_results)
+
+        strategy.payload_mb_per_client = payload_bytes / (1024 ** 2)
+        strategy.payload_params_per_client = payload_bytes // 4
+        best_acc = max(fit_accs)
+        if best_acc > strategy.best_accuracy:
+            strategy.best_accuracy = best_acc
+            print(f"✅ Nuevo mejor modelo (Accuracy: {best_acc:.2%})", flush=True)
+
+        eval_accs, eval_losses = [], []
+        for cid in range(num_clients):
+            client = build_client(cid)
+            loss, _, metrics = client.evaluate(global_params, {})
+            eval_accs.append(metrics["accuracy"])
+            eval_losses.append(loss)
+            del client
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        avg_acc = float(np.mean(eval_accs))
+        total_mb_round = len(fit_results) * strategy.payload_mb_per_client * 2
+        strategy.history_accuracy.append(avg_acc)
+        strategy.history_network_mb.append(total_mb_round)
+
+        print(f"--- Ronda {rnd} ---")
+        print(f"📈 Accuracy: {avg_acc:.2%}  (loss media: {float(np.mean(eval_losses)):.4f})")
+        print(f"📡 Tráfico Red: {total_mb_round:.2f} MB")
+        print("-" * 20, flush=True)
+
+    return global_params
+
+
 def main(
     data_dir: str = None,
     num_clients: int = None,
@@ -170,6 +251,7 @@ def main(
     parser.add_argument("--output-csv", type=str, default="tabla_precision_por_ronda.csv", help="Ruta para guardar tabla de precisión CSV")
     parser.add_argument("--output-plot", type=str, default="evolucion_rendimiento.png", help="Ruta para guardar gráfica de evolución")
     parser.add_argument("--mock-data", action="store_true", help="Generar datos sintéticos para probar la ejecución sin archivos reales")
+    parser.add_argument("--no-ray", action="store_true", help="Ejecutar FedAvg secuencial en un solo proceso, sin Ray (muestra el error real si algo falla y evita que el worker muera por memoria)")
     args, _ = parser.parse_known_args()
 
     # Si se invocó como función Python con parámetros, sobrescribir:
@@ -263,22 +345,19 @@ def main(
                 pass
 
         try:
-            from transformers import AutoModel, AutoTokenizer
+            import transformers  # noqa: F401  (solo verifica que esté instalado)
         except ImportError:
             import subprocess
             print("📦 transformers no detectado. Instalando automáticamente...")
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "transformers", "accelerate"])
-            from transformers import AutoModel, AutoTokenizer
 
-        from model import load_melbert_base
-        print("⏳ Pre-descargando / verificando modelos Transformer base (MentalBERT & MelBERT)...")
+        from huggingface_hub import snapshot_download
+        print("⏳ Descargando / verificando archivos de MentalBERT y MelBERT (sin cargarlos en RAM del proceso principal)...")
         mental_name = "mental/mental-bert-base-uncased"
         mel_name = "EhsanAghazadeh/melbert-roberta"
-        AutoTokenizer.from_pretrained(mental_name, token=hf_token)
-        AutoModel.from_pretrained(mental_name, token=hf_token)
-        AutoTokenizer.from_pretrained(mel_name, token=hf_token)
-        load_melbert_base(mel_name, token=hf_token)
-        print("✅ Modelos base MentalBERT y MelBERT listos en caché local de Hugging Face.")
+        snapshot_download(mental_name, token=hf_token)
+        snapshot_download(mel_name, token=hf_token)
+        print("✅ Archivos de MentalBERT y MelBERT disponibles en la caché local de Hugging Face.")
 
     # 3. Función generadora de clientes (Celda 12)
     def client_fn(cid: str):
@@ -305,47 +384,67 @@ def main(
         "num_gpus": 1.0 if torch.cuda.is_available() else 0.0
     }
 
-    print(f"\n🚀 Iniciando simulación con {args.num_clients} clientes por {args.num_rounds} rondas...")
-    fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=args.num_clients,
-        config=fl.server.ServerConfig(num_rounds=args.num_rounds),
-        strategy=strategy,
-        client_resources=client_resources
-    )
+    if args.no_ray:
+        print(f"\n🚀 Iniciando FedAvg SECUENCIAL (sin Ray) con {args.num_clients} clientes por {args.num_rounds} rondas...")
+
+        def build_numpy_client(cid: int):
+            return FlowerClient(
+                cid=int(cid),
+                vocab=vocab,
+                classes=classes,
+                data_dir=args.data_dir,
+                simulate_failures=args.simulate_failures,
+                vocab_size=global_vocab_size,
+                model_type=args.model_type,
+                freeze_transformers=not args.no_freeze_transformers,
+                shared_models=None,
+                max_seq_len=args.max_seq_len,
+                hf_token=hf_token,
+                batch_size=args.batch_size
+            )
+
+        run_sequential(build_numpy_client, strategy, args.num_clients, args.num_rounds)
+    else:
+        print(f"\n🚀 Iniciando simulación con {args.num_clients} clientes por {args.num_rounds} rondas...")
+        fl.simulation.start_simulation(
+            client_fn=client_fn,
+            num_clients=args.num_clients,
+            config=fl.server.ServerConfig(num_rounds=args.num_rounds),
+            strategy=strategy,
+            client_resources=client_resources,
+            ray_init_args={
+                "include_dashboard": False,
+                "ignore_reinit_error": True,
+                # Por defecto Ray reserva ~30% de la RAM; los parámetros comunicados pesan ~1.5 MB
+                "object_store_memory": 512 * 1024 * 1024,
+            },
+        )
 
     # 4. Reporte Técnico Real (Celda 12)
     print("\n" + "=" * 50)
     print("📡 MÉTRICAS DE RED: APRENDIZAJE FEDERADO".center(50))
     print("=" * 50)
 
-    test_client = FlowerClient(
-        0,
-        vocab=vocab,
-        classes=classes,
-        data_dir=args.data_dir,
-        vocab_size=global_vocab_size,
-        model_type=args.model_type,
-        freeze_transformers=not args.no_freeze_transformers,
-        shared_models=None,
-        max_seq_len=args.max_seq_len,
-        hf_token=hf_token,
-        batch_size=args.batch_size
-    )
-    total_p, active_p, mb_round = test_client.get_dense_stats()
+    # Todo se calcula con el payload real medido en aggregate_fit; no se instancia ningún modelo en el driver
+    active_p = strategy.payload_params_per_client
+    mb_round = strategy.payload_mb_per_client
+    total_p = active_p
+    if args.model_type == "hybrid" and not args.no_freeze_transformers:
+        total_p = active_p + count_backbone_params(hf_token)
     total_transmision_mb = sum(strategy.history_network_mb)
+    active_pct = (100.0 * active_p / total_p) if total_p else 0.0
 
     print("1. Estructura del Modelo:")
     print(f"   - Parámetros Totales: {total_p:,}")
-    print(f"   - Parámetros Activos: {active_p:,} (100.0%)")
+    print(f"   - Parámetros Comunicados/Entrenables: {active_p:,} ({active_pct:.2f}%)")
 
     print("\n2. Carga de Comunicación (Overhead):")
     print(f"   - Payload por cliente (Subida): {mb_round:.2f} MB")
     print(f"   - Tráfico total en la simulación: {total_transmision_mb:.2f} MB")
 
     print("\n3. Estado para el Workshop:")
-    print("   - Este es el baseline denso (Sparsity: 0%)")
-    print("   - Cada comunicación transmite el modelo completo.")
+    print("   - Los backbones MentalBERT/MelBERT están congelados y NO se transmiten.")
+    print("   - Cada comunicación transmite solo las CNN-1D + capas densas.")
     print("=" * 50)
 
     # 5. Visualización de Resultados (Celda 13)
