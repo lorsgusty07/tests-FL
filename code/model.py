@@ -54,6 +54,27 @@ class CNNTextClassifier(nn.Module):
         return self.fc(self.dropout(cat))
 
 
+class CPUMaskDropout(nn.Module):
+    """
+    Dropout invertido cuya máscara se genera en CPU y se aplica en el dispositivo del tensor.
+    Equivale a nn.Dropout, pero evita el kernel CUDA `at::native::dropout_cuda`, que en el
+    worker de Ray termina el proceso con SIGFPE (división por cero). No tiene parámetros.
+    """
+    def __init__(self, p: float = 0.5):
+        super().__init__()
+        self.p = float(p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p <= 0.0:
+            return x
+        keep = 1.0 - self.p
+        mask = (torch.rand(x.shape, device="cpu") < keep).to(device=x.device, dtype=x.dtype)
+        return x * mask / keep
+
+    def extra_repr(self) -> str:
+        return f"p={self.p}"
+
+
 class CascadedCNN1DBlock(nn.Module):
     """
     Paso 3: Módulo CNN-1D en Cascada para Extracción de Características locales.
@@ -85,7 +106,7 @@ class CascadedCNN1DBlock(nn.Module):
         # Proyección final a 384 dimensiones
         self.fc = nn.Linear(256, out_dim)
         self.relu_fc = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = CPUMaskDropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch_size, seq_len, 768] -> Conv1D espera [batch_size, channels, seq_len]
@@ -290,7 +311,7 @@ class HybridTransformerClassifier(nn.Module):
         # Procesa vector fusionado de 768 dimensiones a través de capa oculta de 128 neuronas
         self.fc_hidden = nn.Linear(768, 128)
         self.relu_hidden = nn.ReLU()
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = CPUMaskDropout(0.3)
 
         # Capa de salida: 4 clases (Depresión, Ansiedad, BPD, PTSD)
         self.classifier = nn.Linear(128, num_classes)

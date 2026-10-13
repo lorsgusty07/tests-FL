@@ -1,4 +1,14 @@
 import os
+
+# Evita que transformers cargue TensorFlow/JAX (instalados en Colab). Deben fijarse ANTES de
+# importar torch/transformers/ray para que los workers de Ray hereden estas variables.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+os.environ.setdefault("USE_JAX", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import sys
 import pickle
 import argparse
@@ -453,8 +463,29 @@ def main(
                 "ignore_reinit_error": True,
                 # Por defecto Ray reserva ~30% de la RAM; los parámetros comunicados pesan ~1.5 MB
                 "object_store_memory": 512 * 1024 * 1024,
+                "runtime_env": {"env_vars": {
+                    "USE_TF": "0", "USE_FLAX": "0", "USE_JAX": "0",
+                    "TRANSFORMERS_NO_TF": "1", "TF_CPP_MIN_LOG_LEVEL": "3",
+                    "TOKENIZERS_PARALLELISM": "false",
+                }},
             },
         )
+
+        # Si ningún cliente logró completar un fit, los workers de Ray murieron: se reintenta sin Ray
+        if strategy.payload_params_per_client == 0:
+            print("\n" + "=" * 60)
+            print("⚠️ Ray no completó ningún entrenamiento (los workers murieron).")
+            print("   Reintentando automáticamente con FedAvg secuencial SIN Ray...")
+            print("=" * 60, flush=True)
+            try:
+                import ray
+                ray.shutdown()
+            except Exception:
+                pass
+            strategy.history_accuracy.clear()
+            strategy.history_network_mb.clear()
+            strategy.best_accuracy = 0.0
+            run_sequential(build_numpy_client, strategy, args.num_clients, args.num_rounds)
 
     # 4. Reporte Técnico Real (Celda 12)
     print("\n" + "=" * 50)
