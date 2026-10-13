@@ -1,25 +1,20 @@
-# Dependencias para Aprendizaje Federado
-# Generado a partir del análisis de celdas y orden de instalación en Aprendizaje_Federado.ipynb
+# Dependencias para Aprendizaje Federado (PyTorch + Flower)
+# Compatible con Python 3.10, 3.11 y 3.12+ (incluyendo Google Colab)
 
 # 1. Framework de Aprendizaje Federado (Flower) con soporte de simulación
-flwr[simulation]==1.27.0
+flwr[simulation]>=1.7.0
 
 # 2. Soporte para widgets interactivos
 ipywidgets>=8.0.0
 
-# 3. Ecosistema PyTorch y TorchText (versiones fijadas por compatibilidad estricta con torchtext)
---extra-index-url https://download.pytorch.org/whl/cu118
-torch==2.2.0
-torchvision==0.17.0
-torchaudio==2.2.0
-torchtext==0.16.2
+# 3. Ecosistema PyTorch (aprovecha la versión CUDA preinstalada en Colab)
+torch>=2.2.0
+torchvision>=0.17.0
 
-# 4. Compatibilidad de NumPy (se requiere numpy < 2.0.0 para compatibilidad con torch 2.2.0 y torchtext 0.16.2)
-numpy==1.26.4
-
-# 5. Manipulación de datos y utilidades
+# 4. Manipulación de datos y utilidades
+numpy
 pandas>=2.0.0
 tqdm>=4.66.0
 
-# 6. Visualización de métricas y generación de reportes
+# 5. Visualización de métricas y generación de reportes
 matplotlib>=3.7.0
