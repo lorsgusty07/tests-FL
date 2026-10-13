@@ -217,8 +217,7 @@ def main(
     print(f"✅ Vocabulario cargado ({len(vocab)} tokens). Clases: {len(classes)} ({classes})")
     print(f"📊 Modelo seleccionado: {args.model_type.upper()}")
 
-    # Pre-cargar modelos base si se usa la arquitectura híbrida
-    shared_models = {}
+    # Pre-descargar modelos base si se usa la arquitectura híbrida
     hf_token = args.hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
     if args.model_type == "hybrid":
         if hf_token:
@@ -238,14 +237,14 @@ def main(
             from transformers import AutoModel, AutoTokenizer
 
         from model import load_melbert_base
-        print("⏳ Pre-cargando modelos Transformer base (MentalBERT & MelBERT)...")
+        print("⏳ Pre-descargando / verificando modelos Transformer base (MentalBERT & MelBERT)...")
         mental_name = "mental/mental-bert-base-uncased"
         mel_name = "EhsanAghazadeh/melbert-roberta"
-        shared_models["mental_tokenizer"] = AutoTokenizer.from_pretrained(mental_name, token=hf_token)
-        shared_models["mental_model"] = AutoModel.from_pretrained(mental_name, token=hf_token)
-        shared_models["mel_tokenizer"] = AutoTokenizer.from_pretrained(mel_name, token=hf_token)
-        shared_models["melbert_model"] = load_melbert_base(mel_name, token=hf_token)
-        print("✅ Modelos base MentalBERT y MelBERT cargados exitosamente (pesos 100% restaurados).")
+        AutoTokenizer.from_pretrained(mental_name, token=hf_token)
+        AutoModel.from_pretrained(mental_name, token=hf_token)
+        AutoTokenizer.from_pretrained(mel_name, token=hf_token)
+        load_melbert_base(mel_name, token=hf_token)
+        print("✅ Modelos base MentalBERT y MelBERT listos en caché local de Hugging Face.")
 
     # 3. Función generadora de clientes (Celda 12)
     def client_fn(cid: str):
@@ -258,7 +257,7 @@ def main(
             vocab_size=global_vocab_size,
             model_type=args.model_type,
             freeze_transformers=not args.no_freeze_transformers,
-            shared_models=shared_models,
+            shared_models=None,
             max_seq_len=args.max_seq_len,
             hf_token=hf_token,
             batch_size=args.batch_size
@@ -294,7 +293,7 @@ def main(
         vocab_size=global_vocab_size,
         model_type=args.model_type,
         freeze_transformers=not args.no_freeze_transformers,
-        shared_models=shared_models,
+        shared_models=None,
         max_seq_len=args.max_seq_len,
         hf_token=hf_token,
         batch_size=args.batch_size

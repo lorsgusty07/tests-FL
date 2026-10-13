@@ -6,7 +6,13 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import flwr as fl
 
-from model import TextDataset, CNNTextClassifier, HybridTransformerClassifier, make_collate_fn
+from model import (
+    TextDataset,
+    CNNTextClassifier,
+    HybridTransformerClassifier,
+    make_collate_fn,
+    extract_itos,
+)
 
 
 class FlowerClient(fl.client.NumPyClient):
@@ -58,11 +64,7 @@ class FlowerClient(fl.client.NumPyClient):
             self.vocab_size = max(len(self.vocab), max_tok + 1)
 
         if model_type == "hybrid":
-            vocab_itos = None
-            if hasattr(self.vocab, "get_itos"):
-                vocab_itos = self.vocab.get_itos()
-            elif hasattr(self.vocab, "itos"):
-                vocab_itos = self.vocab.itos
+            vocab_itos = extract_itos(self.vocab)
 
             self.model = HybridTransformerClassifier(
                 num_classes=len(self.classes),

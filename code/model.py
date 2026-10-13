@@ -145,6 +145,68 @@ def load_melbert_base(model_name_or_path: str = "EhsanAghazadeh/melbert-roberta"
     return model
 
 
+def extract_itos(vocab):
+    """Extrae o reconstruye una lista itos (index to string) de cualquier tipo de vocabulario."""
+    if vocab is None:
+        return None
+    if hasattr(vocab, "get_itos"):
+        itos = vocab.get_itos()
+        if itos and len(itos) > 0:
+            return list(itos)
+    if hasattr(vocab, "itos") and isinstance(vocab.itos, (list, tuple)) and len(vocab.itos) > 0:
+        return list(vocab.itos)
+    if hasattr(vocab, "stoi") and isinstance(vocab.stoi, dict) and vocab.stoi:
+        max_idx = max(vocab.stoi.values())
+        itos = ["<unk>"] * (max_idx + 1)
+        for token, idx in vocab.stoi.items():
+            if isinstance(idx, int) and 0 <= idx <= max_idx:
+                itos[idx] = str(token)
+        return itos
+    if isinstance(vocab, dict) and vocab:
+        max_idx = max(vocab.values())
+        itos = ["<unk>"] * (max_idx + 1)
+        for token, idx in vocab.items():
+            if isinstance(idx, int) and 0 <= idx <= max_idx:
+                itos[idx] = str(token)
+        return itos
+    if isinstance(vocab, (list, tuple)):
+        return list(vocab)
+    return None
+
+
+_PROCESS_TRANSFORMERS_CACHE = {}
+
+
+def get_shared_transformers(
+    mental_model_name: str = "mental/mental-bert-base-uncased",
+    melbert_model_name: str = "EhsanAghazadeh/melbert-roberta",
+    hf_token: str = None
+):
+    """Caché a nivel de proceso para evitar serializar 1GB de modelos en Ray IPC."""
+    global _PROCESS_TRANSFORMERS_CACHE
+    if "mental_model" not in _PROCESS_TRANSFORMERS_CACHE:
+        from transformers import AutoModel, AutoTokenizer
+        m_tok = AutoTokenizer.from_pretrained(mental_model_name, token=hf_token)
+        m_mod = AutoModel.from_pretrained(mental_model_name, token=hf_token)
+        m_mod.eval()
+        for p in m_mod.parameters():
+            p.requires_grad = False
+
+        r_tok = AutoTokenizer.from_pretrained(melbert_model_name, token=hf_token)
+        r_mod = load_melbert_base(melbert_model_name, token=hf_token)
+        r_mod.eval()
+        for p in r_mod.parameters():
+            p.requires_grad = False
+
+        _PROCESS_TRANSFORMERS_CACHE = {
+            "mental_tokenizer": m_tok,
+            "mental_model": m_mod,
+            "mel_tokenizer": r_tok,
+            "melbert_model": r_mod,
+        }
+    return _PROCESS_TRANSFORMERS_CACHE
+
+
 class HybridTransformerClassifier(nn.Module):
     """
     Modelo Híbrido Transformer + CNN-1D en Cascada para Clasificación en Ambiente Federado:
@@ -178,25 +240,20 @@ class HybridTransformerClassifier(nn.Module):
         self.pad_idx = pad_idx
         self.hf_token = hf_token
 
-        # Cargar o reutilizar Rama 1: MentalBERT
-        if mental_model is not None:
+        # Si no se pasan modelos precargados, usar caché a nivel de proceso
+        if mental_model is None or melbert_model is None:
+            cache = get_shared_transformers(mental_model_name, melbert_model_name, hf_token)
+            self.mental_tokenizer = mental_tokenizer or cache["mental_tokenizer"]
+            self.mental_bert = mental_model or cache["mental_model"]
+            self.mel_tokenizer = mel_tokenizer or cache["mel_tokenizer"]
+            self.melbert = melbert_model or cache["melbert_model"]
+        else:
             self.mental_bert = mental_model
             self.mental_tokenizer = mental_tokenizer
-        else:
-            from transformers import AutoModel, AutoTokenizer
-            self.mental_tokenizer = AutoTokenizer.from_pretrained(mental_model_name, token=hf_token)
-            self.mental_bert = AutoModel.from_pretrained(mental_model_name, token=hf_token)
-
-        # Cargar o reutilizar Rama 2: MelBERT
-        if melbert_model is not None:
             self.melbert = melbert_model
             self.mel_tokenizer = mel_tokenizer
-        else:
-            from transformers import AutoTokenizer
-            self.mel_tokenizer = AutoTokenizer.from_pretrained(melbert_model_name, token=hf_token)
-            self.melbert = load_melbert_base(melbert_model_name, token=hf_token)
 
-        # Si se congelan los transformers, no computan gradientes en clientes federados
+        # Si se congelan los transformers, asegurar requires_grad = False
         if self.freeze_transformers:
             for p in self.mental_bert.parameters():
                 p.requires_grad = False
@@ -224,23 +281,32 @@ class HybridTransformerClassifier(nn.Module):
         # Caso 1: Lista de strings de texto
         if isinstance(x, (list, tuple)) and len(x) > 0 and isinstance(x[0], str):
             texts = list(x)
-        # Caso 2: Tensor de IDs numéricos -> Si hay vocab_itos, decodificar a texto
+        # Caso 2: Tensor de IDs numéricos
         elif isinstance(x, torch.Tensor):
-            if self.vocab_itos is not None:
+            if self.vocab_itos is not None and len(self.vocab_itos) > 0:
                 texts = []
+                vocab_len = len(self.vocab_itos)
                 for seq in x:
+                    seq_list = seq.tolist() if hasattr(seq, "tolist") else seq
                     words = [
-                        self.vocab_itos[tok.item()]
-                        for tok in seq
-                        if tok.item() < len(self.vocab_itos)
-                        and self.vocab_itos[tok.item()] not in ("<pad>", "<unk>")
+                        self.vocab_itos[tok]
+                        for tok in seq_list
+                        if 0 <= tok < vocab_len and self.vocab_itos[tok] not in ("<pad>", "<unk>", None)
                     ]
-                    texts.append(" ".join(words) if words else "<pad>")
+                    texts.append(" ".join(words) if words else "empty")
             else:
-                # Si no hay vocab_itos, pasar directamente como input_ids
+                # Si no hay vocab_itos disponible, clamp estricto para evitar CUDA asserts
+                mental_vocab_size = getattr(self.mental_bert.config, "vocab_size", 30522)
+                mel_vocab_size = getattr(self.melbert.config, "vocab_size", 50265)
+
                 input_ids = x.to(device)
                 attn_mask = (input_ids != self.pad_idx).long().to(device)
-                return {"input_ids": input_ids, "attention_mask": attn_mask}, {"input_ids": input_ids, "attention_mask": attn_mask}
+                m_ids = torch.clamp(input_ids, 0, mental_vocab_size - 1)
+                r_ids = torch.clamp(input_ids, 0, mel_vocab_size - 1)
+                return (
+                    {"input_ids": m_ids, "attention_mask": attn_mask},
+                    {"input_ids": r_ids, "attention_mask": attn_mask}
+                )
         else:
             texts = [str(t) for t in x]
 
