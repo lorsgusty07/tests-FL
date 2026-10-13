@@ -6,19 +6,32 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import flwr as fl
 
-from model import TextDataset, CNNTextClassifier, make_collate_fn
+from model import TextDataset, CNNTextClassifier, HybridTransformerClassifier, make_collate_fn
 
 
 class FlowerClient(fl.client.NumPyClient):
     """
-    Cliente federado basado en la celda 11 del notebook Aprendizaje_Federado.ipynb.
-    Maneja el entrenamiento y evaluación local con CNNTextClassifier.
+    Cliente federado para modelos de clasificación de texto.
+    Soporta modelo híbrido Transformer (MentalBERT + MelBERT + CNN-1D) y baseline CNN.
     """
-    def __init__(self, cid: int, vocab: dict, classes: list, data_dir: str = None, simulate_failures: bool = False, vocab_size: int = None):
+    def __init__(
+        self,
+        cid: int,
+        vocab: dict,
+        classes: list,
+        data_dir: str = None,
+        simulate_failures: bool = False,
+        vocab_size: int = None,
+        model_type: str = "hybrid",
+        freeze_transformers: bool = True,
+        shared_models: dict = None,
+        max_seq_len: int = 128
+    ):
         self.cid = int(cid)
         self.vocab = vocab
         self.classes = classes
         self.data_dir = data_dir
+        self.model_type = model_type
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.pad_idx = vocab['<pad>'] if '<pad>' in vocab else 0
 
@@ -37,13 +50,35 @@ class FlowerClient(fl.client.NumPyClient):
                         max_tok = m
             self.vocab_size = max(len(self.vocab), max_tok + 1)
 
-        self.model = CNNTextClassifier(
-            vocab_size=self.vocab_size,
-            num_classes=len(self.classes),
-            pad_idx=self.pad_idx
-        ).to(self.device)
+        if model_type == "hybrid":
+            vocab_itos = None
+            if hasattr(self.vocab, "get_itos"):
+                vocab_itos = self.vocab.get_itos()
+            elif hasattr(self.vocab, "itos"):
+                vocab_itos = self.vocab.itos
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+            self.model = HybridTransformerClassifier(
+                num_classes=len(self.classes),
+                freeze_transformers=freeze_transformers,
+                max_seq_len=max_seq_len,
+                vocab_itos=vocab_itos,
+                pad_idx=self.pad_idx,
+                mental_model=shared_models.get("mental_model") if shared_models else None,
+                melbert_model=shared_models.get("melbert_model") if shared_models else None,
+                mental_tokenizer=shared_models.get("mental_tokenizer") if shared_models else None,
+                mel_tokenizer=shared_models.get("mel_tokenizer") if shared_models else None
+            ).to(self.device)
+
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            self.optimizer = optim.Adam(trainable_params, lr=1e-4)
+        else:
+            self.model = CNNTextClassifier(
+                vocab_size=self.vocab_size,
+                num_classes=len(self.classes),
+                pad_idx=self.pad_idx
+            ).to(self.device)
+            self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+
         self.criterion = nn.CrossEntropyLoss()
         self.simulate_failures = simulate_failures
 
@@ -90,13 +125,23 @@ class FlowerClient(fl.client.NumPyClient):
         )
 
     def get_parameters(self, config=None):
+        if hasattr(self.model, "freeze_transformers") and self.model.freeze_transformers:
+            return [p.detach().cpu().numpy() for p in self.model.parameters() if p.requires_grad]
         return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
+
+    def set_parameters(self, parameters):
+        if hasattr(self.model, "freeze_transformers") and self.model.freeze_transformers:
+            trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+            for p, val in zip(trainable_params, parameters):
+                p.data.copy_(torch.from_numpy(val).to(p.device))
+        else:
+            self.model.load_state_dict({k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), parameters)})
 
     def fit(self, parameters, config):
         if self.simulate_failure():  # Simulación de fallo
             return self.get_parameters({}), 0, {"accuracy": 0.0, "failed": True}
 
-        self.model.load_state_dict({k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), parameters)})
+        self.set_parameters(parameters)
 
         total_samples = 0
         correct = 0
@@ -118,7 +163,7 @@ class FlowerClient(fl.client.NumPyClient):
         return self.get_parameters({}), len(self.trainloader.dataset), {"accuracy": accuracy, "failed": False}
 
     def evaluate(self, parameters, config):
-        self.model.load_state_dict({k: torch.tensor(v) for k, v in zip(self.model.state_dict().keys(), parameters)})
+        self.set_parameters(parameters)
         self.model.eval()
 
         correct, total, loss = 0, 0, 0.0
@@ -134,12 +179,12 @@ class FlowerClient(fl.client.NumPyClient):
         return float(loss / total), total, {"accuracy": accuracy}
 
     def get_dense_stats(self):
-        """Calcula el peso real de los parámetros para el modelo denso."""
-        # Contamos todos los parámetros del modelo
+        """Calcula el peso real de los parámetros comunicados en la red federada."""
         total_params = sum(p.numel() for p in self.model.parameters())
-
-        # En el modelo denso, el 100% de los parámetros son "activos"
-        active_params = total_params
+        if hasattr(self.model, "freeze_transformers") and self.model.freeze_transformers:
+            active_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        else:
+            active_params = total_params
 
         # Peso en MB (4 bytes por parámetro float32)
         mb_size = (active_params * 4) / (1024**2)

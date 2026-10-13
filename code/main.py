@@ -127,6 +127,9 @@ def main(
     parser.add_argument("--data-dir", type=str, default=default_data_dir, help="Directorio con datos federados")
     parser.add_argument("--num-clients", type=int, default=5, help="Número de clientes federados")
     parser.add_argument("--num-rounds", type=int, default=10, help="Número de rondas de comunicación")
+    parser.add_argument("--model-type", type=str, choices=["hybrid", "cnn"], default="hybrid", help="Arquitectura del modelo ('hybrid' o 'cnn')")
+    parser.add_argument("--no-freeze-transformers", action="store_true", help="No congelar las capas base de Transformers (por defecto están congeladas para eficiencia federada)")
+    parser.add_argument("--max-seq-len", type=int, default=128, help="Longitud máxima de secuencia para los Transformers")
     parser.add_argument("--simulate-failures", action="store_true", help="Habilitar simulación de fallos aleatorios")
     parser.add_argument("--output-csv", type=str, default="tabla_precision_por_ronda.csv", help="Ruta para guardar tabla de precisión CSV")
     parser.add_argument("--output-plot", type=str, default="evolucion_rendimiento.png", help="Ruta para guardar gráfica de evolución")
@@ -150,7 +153,11 @@ def main(
         args.mock_data = True
 
     print("==================================================")
-    print(" INICIANDO APRENDIZAJE FEDERADO (BASELINE DENSO) ")
+    print(" INICIANDO APRENDIZAJE FEDERADO ")
+    if args.model_type == "hybrid":
+        print(" MODELO HÍBRIDO (MentalBERT + MelBERT + CNN-1D)")
+    else:
+        print(" MODELO BASELINE DENSO (CNN)")
     print("==================================================")
 
     # Si se solicita --mock-data, generar datos sintéticos temporales
@@ -163,7 +170,7 @@ def main(
         vocab = {"<pad>": 0, "<unk>": 1}
         for w in range(2, 500):
             vocab[f"token_{w}"] = w
-        classes = ["clase_0", "clase_1"]
+        classes = ["Depresion", "Ansiedad", "BPD", "PTSD"]
         
         np.savez(metadata_path, classes=np.array(classes))
         with open(vocab_path, "wb") as f:
@@ -172,7 +179,7 @@ def main(
         for cid in range(args.num_clients):
             n_samples = 40
             dummy_texts = [np.random.randint(1, 500, size=np.random.randint(10, 30)) for _ in range(n_samples)]
-            dummy_labels = np.random.randint(0, 2, size=n_samples)
+            dummy_labels = np.random.randint(0, len(classes), size=n_samples)
             np.savez(os.path.join(args.data_dir, f"client_{cid}.npz"), texts=np.array(dummy_texts, dtype=object), labels=dummy_labels)
         print("✅ Datos sintéticos de prueba generados exitosamente.\n")
 
@@ -206,7 +213,27 @@ def main(
                             global_vocab_size = m + 1
 
     print(f"✅ Vocabulario cargado ({len(vocab)} tokens). Clases: {len(classes)} ({classes})")
-    print(f"📊 Tamaño efectivo del vocabulario para la CNN: {global_vocab_size}")
+    print(f"📊 Modelo seleccionado: {args.model_type.upper()}")
+
+    # Pre-cargar modelos base si se usa la arquitectura híbrida
+    shared_models = {}
+    if args.model_type == "hybrid":
+        try:
+            from transformers import AutoModel, AutoTokenizer
+        except ImportError:
+            import subprocess
+            print("📦 transformers no detectado. Instalando automáticamente...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "transformers", "accelerate"])
+            from transformers import AutoModel, AutoTokenizer
+
+        print("⏳ Pre-cargando modelos Transformer base (MentalBERT & MelBERT)...")
+        mental_name = "mental/mental-bert-base-uncased"
+        mel_name = "EhsanAghazadeh/melbert-roberta"
+        shared_models["mental_tokenizer"] = AutoTokenizer.from_pretrained(mental_name)
+        shared_models["mental_model"] = AutoModel.from_pretrained(mental_name)
+        shared_models["mel_tokenizer"] = AutoTokenizer.from_pretrained(mel_name)
+        shared_models["melbert_model"] = AutoModel.from_pretrained(mel_name)
+        print("✅ Modelos base MentalBERT y MelBERT cargados exitosamente.")
 
     # 3. Función generadora de clientes (Celda 12)
     def client_fn(cid: str):
@@ -216,7 +243,11 @@ def main(
             classes=classes,
             data_dir=args.data_dir,
             simulate_failures=args.simulate_failures,
-            vocab_size=global_vocab_size
+            vocab_size=global_vocab_size,
+            model_type=args.model_type,
+            freeze_transformers=not args.no_freeze_transformers,
+            shared_models=shared_models,
+            max_seq_len=args.max_seq_len
         )
         return client.to_client() if hasattr(client, "to_client") else client
 
@@ -238,10 +269,20 @@ def main(
 
     # 4. Reporte Técnico Real (Celda 12)
     print("\n" + "=" * 50)
-    print("📡 MÉTRICAS DE RED: MODELO DENSO (BASELINE)".center(50))
+    print("📡 MÉTRICAS DE RED: APRENDIZAJE FEDERADO".center(50))
     print("=" * 50)
 
-    test_client = FlowerClient(0, vocab=vocab, classes=classes, data_dir=args.data_dir, vocab_size=global_vocab_size)
+    test_client = FlowerClient(
+        0,
+        vocab=vocab,
+        classes=classes,
+        data_dir=args.data_dir,
+        vocab_size=global_vocab_size,
+        model_type=args.model_type,
+        freeze_transformers=not args.no_freeze_transformers,
+        shared_models=shared_models,
+        max_seq_len=args.max_seq_len
+    )
     total_p, active_p, mb_round = test_client.get_dense_stats()
     total_transmision_mb = sum(strategy.history_network_mb)
 

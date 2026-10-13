@@ -17,5 +17,9 @@ numpy
 pandas>=2.0.0
 tqdm>=4.66.0
 
-# 5. Visualización de métricas y generación de reportes
+# 5. Modelos Transformers (Hugging Face)
+transformers>=4.38.0
+accelerate>=0.26.0
+
+# 6. Visualización de métricas y generación de reportes
 matplotlib>=3.7.0
