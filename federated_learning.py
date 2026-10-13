@@ -258,7 +258,15 @@ class CustomStrategy(fl.server.strategy.FedAvg):
 # =====================================================================
 # 4. Orquestación y Ejecución de la Simulación (Celdas 9, 12, 13, 14)
 # =====================================================================
-def run_federated_learning():
+def run_federated_learning(
+    data_dir: str = None,
+    num_clients: int = None,
+    num_rounds: int = None,
+    simulate_failures: bool = False,
+    output_csv: str = None,
+    output_plot: str = None,
+    mock_data: bool = False
+):
     default_data_dir = (
         "/content/drive/My Drive/federated_text_data"
         if os.path.exists("/content/drive/My Drive/federated_text_data")
@@ -272,7 +280,23 @@ def run_federated_learning():
     parser.add_argument("--output-csv", type=str, default="tabla_precision_por_ronda.csv", help="Archivo CSV de salida")
     parser.add_argument("--output-plot", type=str, default="evolucion_rendimiento.png", help="Archivo de gráfica PNG")
     parser.add_argument("--mock-data", action="store_true", help="Generar datos sintéticos para probar la ejecución sin archivos reales")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
+
+    # Si se invocó como función Python con parámetros, sobrescribir:
+    if data_dir is not None:
+        args.data_dir = data_dir
+    if num_clients is not None:
+        args.num_clients = num_clients
+    if num_rounds is not None:
+        args.num_rounds = num_rounds
+    if simulate_failures:
+        args.simulate_failures = True
+    if output_csv is not None:
+        args.output_csv = output_csv
+    if output_plot is not None:
+        args.output_plot = output_plot
+    if mock_data:
+        args.mock_data = True
 
     print("==================================================")
     print(" INICIANDO APRENDIZAJE FEDERADO (BASELINE DENSO) ")
