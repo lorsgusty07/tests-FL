@@ -130,6 +130,7 @@ def main(
     parser.add_argument("--model-type", type=str, choices=["hybrid", "cnn"], default="hybrid", help="Arquitectura del modelo ('hybrid' o 'cnn')")
     parser.add_argument("--no-freeze-transformers", action="store_true", help="No congelar las capas base de Transformers (por defecto están congeladas para eficiencia federada)")
     parser.add_argument("--max-seq-len", type=int, default=128, help="Longitud máxima de secuencia para los Transformers")
+    parser.add_argument("--hf-token", type=str, default=os.getenv("HF_TOKEN", None), help="Token de autenticación de Hugging Face para modelos gated")
     parser.add_argument("--simulate-failures", action="store_true", help="Habilitar simulación de fallos aleatorios")
     parser.add_argument("--output-csv", type=str, default="tabla_precision_por_ronda.csv", help="Ruta para guardar tabla de precisión CSV")
     parser.add_argument("--output-plot", type=str, default="evolucion_rendimiento.png", help="Ruta para guardar gráfica de evolución")
@@ -217,7 +218,16 @@ def main(
 
     # Pre-cargar modelos base si se usa la arquitectura híbrida
     shared_models = {}
+    hf_token = args.hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
     if args.model_type == "hybrid":
+        if hf_token:
+            try:
+                import huggingface_hub
+                huggingface_hub.login(token=hf_token, add_to_git_credential=False)
+                print("🔑 Autenticación con Hugging Face exitosa.")
+            except Exception:
+                pass
+
         try:
             from transformers import AutoModel, AutoTokenizer
         except ImportError:
@@ -229,10 +239,10 @@ def main(
         print("⏳ Pre-cargando modelos Transformer base (MentalBERT & MelBERT)...")
         mental_name = "mental/mental-bert-base-uncased"
         mel_name = "EhsanAghazadeh/melbert-roberta"
-        shared_models["mental_tokenizer"] = AutoTokenizer.from_pretrained(mental_name)
-        shared_models["mental_model"] = AutoModel.from_pretrained(mental_name)
-        shared_models["mel_tokenizer"] = AutoTokenizer.from_pretrained(mel_name)
-        shared_models["melbert_model"] = AutoModel.from_pretrained(mel_name)
+        shared_models["mental_tokenizer"] = AutoTokenizer.from_pretrained(mental_name, token=hf_token)
+        shared_models["mental_model"] = AutoModel.from_pretrained(mental_name, token=hf_token)
+        shared_models["mel_tokenizer"] = AutoTokenizer.from_pretrained(mel_name, token=hf_token)
+        shared_models["melbert_model"] = AutoModel.from_pretrained(mel_name, token=hf_token)
         print("✅ Modelos base MentalBERT y MelBERT cargados exitosamente.")
 
     # 3. Función generadora de clientes (Celda 12)
@@ -247,7 +257,8 @@ def main(
             model_type=args.model_type,
             freeze_transformers=not args.no_freeze_transformers,
             shared_models=shared_models,
-            max_seq_len=args.max_seq_len
+            max_seq_len=args.max_seq_len,
+            hf_token=hf_token
         )
         return client.to_client() if hasattr(client, "to_client") else client
 
@@ -281,7 +292,8 @@ def main(
         model_type=args.model_type,
         freeze_transformers=not args.no_freeze_transformers,
         shared_models=shared_models,
-        max_seq_len=args.max_seq_len
+        max_seq_len=args.max_seq_len,
+        hf_token=hf_token
     )
     total_p, active_p, mb_round = test_client.get_dense_stats()
     total_transmision_mb = sum(strategy.history_network_mb)

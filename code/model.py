@@ -128,7 +128,8 @@ class HybridTransformerClassifier(nn.Module):
         mental_model: nn.Module = None,
         melbert_model: nn.Module = None,
         mental_tokenizer = None,
-        mel_tokenizer = None
+        mel_tokenizer = None,
+        hf_token: str = None
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -136,6 +137,7 @@ class HybridTransformerClassifier(nn.Module):
         self.max_seq_len = max_seq_len
         self.vocab_itos = vocab_itos
         self.pad_idx = pad_idx
+        self.hf_token = hf_token
 
         # Cargar o reutilizar Rama 1: MentalBERT
         if mental_model is not None:
@@ -143,8 +145,8 @@ class HybridTransformerClassifier(nn.Module):
             self.mental_tokenizer = mental_tokenizer
         else:
             from transformers import AutoModel, AutoTokenizer
-            self.mental_tokenizer = AutoTokenizer.from_pretrained(mental_model_name)
-            self.mental_bert = AutoModel.from_pretrained(mental_model_name)
+            self.mental_tokenizer = AutoTokenizer.from_pretrained(mental_model_name, token=hf_token)
+            self.mental_bert = AutoModel.from_pretrained(mental_model_name, token=hf_token)
 
         # Cargar o reutilizar Rama 2: MelBERT
         if melbert_model is not None:
@@ -152,8 +154,8 @@ class HybridTransformerClassifier(nn.Module):
             self.mel_tokenizer = mel_tokenizer
         else:
             from transformers import AutoModel, AutoTokenizer
-            self.mel_tokenizer = AutoTokenizer.from_pretrained(melbert_model_name)
-            self.melbert = AutoModel.from_pretrained(melbert_model_name)
+            self.mel_tokenizer = AutoTokenizer.from_pretrained(melbert_model_name, token=hf_token)
+            self.melbert = AutoModel.from_pretrained(melbert_model_name, token=hf_token)
 
         # Si se congelan los transformers, no computan gradientes en clientes federados
         if self.freeze_transformers:

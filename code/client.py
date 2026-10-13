@@ -25,7 +25,8 @@ class FlowerClient(fl.client.NumPyClient):
         model_type: str = "hybrid",
         freeze_transformers: bool = True,
         shared_models: dict = None,
-        max_seq_len: int = 128
+        max_seq_len: int = 128,
+        hf_token: str = None
     ):
         self.cid = int(cid)
         self.vocab = vocab
@@ -66,7 +67,8 @@ class FlowerClient(fl.client.NumPyClient):
                 mental_model=shared_models.get("mental_model") if shared_models else None,
                 melbert_model=shared_models.get("melbert_model") if shared_models else None,
                 mental_tokenizer=shared_models.get("mental_tokenizer") if shared_models else None,
-                mel_tokenizer=shared_models.get("mel_tokenizer") if shared_models else None
+                mel_tokenizer=shared_models.get("mel_tokenizer") if shared_models else None,
+                hf_token=hf_token
             ).to(self.device)
 
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
