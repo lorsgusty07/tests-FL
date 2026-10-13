@@ -146,31 +146,53 @@ def load_melbert_base(model_name_or_path: str = "EhsanAghazadeh/melbert-roberta"
 
 
 def extract_itos(vocab):
-    """Extrae o reconstruye una lista itos (index to string) de cualquier tipo de vocabulario."""
+    """Extrae o reconstruye una lista itos (index to string) de cualquier tipo de vocabulario de forma segura."""
     if vocab is None:
         return None
+
+    # 1. Método get_itos()
     if hasattr(vocab, "get_itos"):
-        itos = vocab.get_itos()
-        if itos and len(itos) > 0:
-            return list(itos)
-    if hasattr(vocab, "itos") and isinstance(vocab.itos, (list, tuple)) and len(vocab.itos) > 0:
+        try:
+            itos = vocab.get_itos()
+            if itos and isinstance(itos, (list, tuple)) and len(itos) > 0 and isinstance(itos[0], str):
+                return list(itos)
+        except Exception:
+            pass
+
+    # 2. Atributo itos
+    if hasattr(vocab, "itos") and isinstance(vocab.itos, (list, tuple)) and len(vocab.itos) > 0 and isinstance(vocab.itos[0], str):
         return list(vocab.itos)
-    if hasattr(vocab, "stoi") and isinstance(vocab.stoi, dict) and vocab.stoi:
-        max_idx = max(vocab.stoi.values())
-        itos = ["<unk>"] * (max_idx + 1)
-        for token, idx in vocab.stoi.items():
-            if isinstance(idx, int) and 0 <= idx <= max_idx:
+
+    # 3. Atributo stoi con mapeo token(str) -> idx(int estricto, excluyendo booleans y OrderedDict)
+    if hasattr(vocab, "stoi") and isinstance(vocab.stoi, dict):
+        valid_stoi = {k: v for k, v in vocab.stoi.items() if isinstance(k, str) and type(v) is int and v >= 0}
+        if valid_stoi:
+            max_idx = max(valid_stoi.values())
+            itos = ["<unk>"] * (max_idx + 1)
+            for token, idx in valid_stoi.items():
                 itos[idx] = str(token)
-        return itos
-    if isinstance(vocab, dict) and vocab:
-        max_idx = max(vocab.values())
-        itos = ["<unk>"] * (max_idx + 1)
-        for token, idx in vocab.items():
-            if isinstance(idx, int) and 0 <= idx <= max_idx:
+            return itos
+
+    # 4. Diccionario estándar token -> idx(int estricto)
+    if isinstance(vocab, dict):
+        valid_stoi = {k: v for k, v in vocab.items() if isinstance(k, str) and type(v) is int and v >= 0}
+        if valid_stoi:
+            max_idx = max(valid_stoi.values())
+            itos = ["<unk>"] * (max_idx + 1)
+            for token, idx in valid_stoi.items():
                 itos[idx] = str(token)
-        return itos
-    if isinstance(vocab, (list, tuple)):
+            return itos
+
+    # 5. Lista o tupla directa de strings
+    if isinstance(vocab, (list, tuple)) and len(vocab) > 0 and isinstance(vocab[0], str):
         return list(vocab)
+
+    # 6. Atributos anidados (tokens, _tokens, vocab, etc.)
+    for attr in ["tokens", "_tokens", "vocab", "_vocab", "itos", "_itos"]:
+        val = getattr(vocab, attr, None)
+        if isinstance(val, (list, tuple)) and len(val) > 0 and isinstance(val[0], str):
+            return list(val)
+
     return None
 
 

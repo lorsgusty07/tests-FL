@@ -43,24 +43,49 @@ class LegacyVocab:
     def __init__(self, *args, **kwargs):
         self.stoi = {}
         self.itos = []
-        if args:
-            self._extract(args)
+        for a in args:
+            self._extract(a)
 
     def _extract(self, obj):
-        if isinstance(obj, dict):
-            if "stoi" in obj:
-                self.stoi.update(obj["stoi"])
-            elif "_stoi" in obj:
-                self.stoi.update(obj["_stoi"])
-            else:
-                self.stoi.update(obj)
-            if "itos" in obj:
-                self.itos = list(obj["itos"])
-            elif "_itos" in obj:
-                self.itos = list(obj["_itos"])
-        elif isinstance(obj, (list, tuple)):
+        if obj is None:
+            return
+        if isinstance(obj, (list, tuple)):
+            if obj and isinstance(obj[0], str):
+                self.itos = list(obj)
+                self.stoi = {tok: idx for idx, tok in enumerate(self.itos)}
+                return
             for item in obj:
                 self._extract(item)
+        elif isinstance(obj, dict):
+            if "itos" in obj and isinstance(obj["itos"], (list, tuple)):
+                self.itos = list(obj["itos"])
+                self.stoi = {tok: idx for idx, tok in enumerate(self.itos)}
+                return
+            if "_itos" in obj and isinstance(obj["_itos"], (list, tuple)):
+                self.itos = list(obj["_itos"])
+                self.stoi = {tok: idx for idx, tok in enumerate(self.itos)}
+                return
+            if "stoi" in obj and isinstance(obj["stoi"], dict):
+                self._extract(obj["stoi"])
+                return
+            if "_stoi" in obj and isinstance(obj["_stoi"], dict):
+                self._extract(obj["_stoi"])
+                return
+
+            # Pares reales token (str) -> índice (int estricto, nunca booleans ni dicts)
+            token_map = {k: v for k, v in obj.items() if isinstance(k, str) and type(v) is int and not k.startswith("_")}
+            if token_map:
+                self.stoi.update(token_map)
+                max_idx = max(self.stoi.values())
+                if len(self.itos) <= max_idx:
+                    self.itos = ["<unk>"] * (max_idx + 1)
+                    for tok, idx in self.stoi.items():
+                        if 0 <= idx <= max_idx:
+                            self.itos[idx] = tok
+            else:
+                for k, v in obj.items():
+                    if k not in ["_modules", "_parameters", "_buffers", "training"]:
+                        self._extract(v)
         elif hasattr(obj, "__dict__"):
             self._extract(obj.__dict__)
 
@@ -68,18 +93,26 @@ class LegacyVocab:
         self.stoi = {}
         self.itos = []
         if isinstance(state, dict):
-            self.__dict__.update(state)
             self._extract(state)
         elif isinstance(state, (list, tuple)):
             self._extract(state)
+
         if not self.stoi and self.itos:
             self.stoi = {tok: idx for idx, tok in enumerate(self.itos)}
+        elif self.stoi and not self.itos:
+            valid_stoi = {k: v for k, v in self.stoi.items() if isinstance(k, str) and type(v) is int}
+            if valid_stoi:
+                max_idx = max(valid_stoi.values())
+                self.itos = ["<unk>"] * (max_idx + 1)
+                for tok, idx in valid_stoi.items():
+                    if 0 <= idx <= max_idx:
+                        self.itos[idx] = tok
 
     def __getitem__(self, token):
         return self.stoi.get(token, self.stoi.get("<unk>", 0))
 
     def __len__(self):
-        return len(self.stoi) if self.stoi else len(self.itos)
+        return len(self.itos) if self.itos else len(self.stoi)
 
     def __contains__(self, token):
         return token in self.stoi
