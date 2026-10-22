@@ -10,6 +10,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import sys
+import json
 import pickle
 import argparse
 import numpy as np
@@ -210,9 +211,9 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
 
             K = len(fit_results)
             sd_vals = np.ones(K, dtype=np.float32)
-            has_vectors = len(exp_vectors) == K and len(exp_vectors[0]) > 0
+            has_vectors = K > 0 and all(len(v) > 0 for v in exp_vectors) and len({len(v) for v in exp_vectors}) == 1
+            exp_mat = np.array(exp_vectors, dtype=np.float32) if has_vectors else None
             if has_vectors and K > 1:
-                exp_mat = np.array(exp_vectors, dtype=np.float32)
                 for i in range(K):
                     other_centroid = np.mean(np.delete(exp_mat, i, axis=0), axis=0)
                     norm_i = np.linalg.norm(exp_mat[i])
@@ -234,8 +235,31 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
             weighted_fit = [(res[0], float(w)) for res, w in zip(fit_results, sem_weights)]
             global_params = aggregate(weighted_fit)
 
-            if has_vectors:
-                strategy.kg_manager.update_graph(sem_weights.tolist(), exp_vectors, rnd)
+            client_class_exps = []
+            client_class_counts = []
+            for res in fit_results:
+                raw_ce = res[2].get("class_explanations_json")
+                if raw_ce:
+                    try:
+                        client_class_exps.append(json.loads(raw_ce))
+                    except Exception:
+                        client_class_exps.append([])
+                else:
+                    client_class_exps.append([])
+                client_class_counts.append(res[2].get("class_counts", []))
+
+            if has_vectors and any(len(e) > 0 for e in client_class_exps):
+                strategy.kg_manager.update_graph(
+                    sem_weights.tolist(),
+                    client_class_exps,
+                    client_class_counts,
+                    rnd
+                )
+                kg_file = os.path.join(strategy.data_dir or ".", "global_knowledge_graph_latest.ttl")
+                try:
+                    strategy.kg_manager.export_turtle(kg_file)
+                except Exception as e:
+                    print(f"⚠️ Error al exportar grafo Turtle: {e}")
 
             print(f"\n" + "=" * 62)
             print(f"🧠 AGREGACIÓN SEMÁNTICA SemFedXAI — RONDA {rnd}".center(62))
@@ -247,11 +271,10 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
             print("-" * 62)
             print(f"Promedios: SR={np.mean(sr_vals):.3f} | DC={np.mean(dc_vals):.3f} | SD={np.mean(sd_vals):.3f}")
 
-            if has_vectors:
-                mean_exp = np.mean(exp_mat, axis=0).tolist()
+            if has_vectors and strategy.kg_manager.last_round > 0:
                 print("\n📋 NARRATIVAS CLÍNICAS EXPLICABLES (Explanation Generator):")
-                for c_name in strategy.class_names[:2]:
-                    narrative = strategy.expl_generator.generate_clinical_narrative(mean_exp, c_name, top_k=2)
+                for c_idx in range(min(2, len(strategy.class_names))):
+                    narrative = strategy.expl_generator.global_class_narrative(strategy.kg_manager, c_idx, top_k=2)
                     print(narrative)
                     print()
             print("=" * 62 + "\n")
@@ -300,7 +323,8 @@ def main(
     strategy_name: str = None,
     alpha: float = None,
     beta: float = None,
-    gamma: float = None
+    gamma: float = None,
+    lambda_onto: float = None
 ):
     default_data_dir = (
         "/content/drive/My Drive/federated_text_data"
@@ -315,6 +339,7 @@ def main(
     parser.add_argument("--alpha", type=float, default=0.5, help="SemFedXAI: Ponderación de Relevancia Semántica (SR)")
     parser.add_argument("--beta", type=float, default=0.5, help="SemFedXAI: Ponderación de Consistencia Ontológica (DC)")
     parser.add_argument("--gamma", type=float, default=1.2, help="SemFedXAI: Base exponencial para Diversidad Semántica (SD)")
+    parser.add_argument("--lambda-onto", type=float, default=0.1, help="SemFedXAI: Peso de la pérdida ontológica auxiliar L_onto")
     parser.add_argument("--model-type", type=str, choices=["hybrid", "cnn"], default="hybrid", help="Arquitectura del modelo ('hybrid' o 'cnn')")
     parser.add_argument("--no-freeze-transformers", action="store_true", help="No congelar las capas base de Transformers (por defecto están congeladas para eficiencia federada)")
     parser.add_argument("--max-seq-len", type=int, default=128, help="Longitud máxima de secuencia para los Transformers")
@@ -352,11 +377,13 @@ def main(
         args.beta = beta
     if gamma is not None:
         args.gamma = gamma
+    if lambda_onto is not None:
+        args.lambda_onto = lambda_onto
 
     print("==================================================")
     print(" INICIANDO APRENDIZAJE FEDERADO ")
     if args.strategy == "semfedxai":
-        print(f" ESTRATEGIA: SemFedXAI (α={args.alpha}, β={args.beta}, γ={args.gamma})")
+        print(f" ESTRATEGIA: SemFedXAI (α={args.alpha}, β={args.beta}, γ={args.gamma}, λ_onto={args.lambda_onto})")
     else:
         print(" ESTRATEGIA: FedAvg Convencional (Baseline)")
     if args.model_type == "hybrid":
@@ -472,7 +499,8 @@ def main(
             hf_token=hf_token,
             batch_size=args.batch_size,
             use_semfedxai=(args.strategy == "semfedxai"),
-            knowledge_base=kb
+            knowledge_base=kb,
+            lambda_onto=args.lambda_onto
         )
         return client.to_client() if hasattr(client, "to_client") else client
 
@@ -510,7 +538,8 @@ def main(
             hf_token=hf_token,
             batch_size=args.batch_size,
             use_semfedxai=(args.strategy == "semfedxai"),
-            knowledge_base=kb
+            knowledge_base=kb,
+            lambda_onto=args.lambda_onto
         )
 
     # Modo hijo del preflight: ejecuta 1 cliente real (2 batches) y termina

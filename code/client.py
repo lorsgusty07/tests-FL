@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import faulthandler
 import numpy as np
 import torch
@@ -18,6 +19,7 @@ from model import (
 from semantic_modules import (
     DSM5KnowledgeBase,
     LocalKnowledgeEnhancer,
+    OntologyAlignmentLoss,
     LocalExplainer,
 )
 
@@ -65,7 +67,8 @@ class FlowerClient(fl.client.NumPyClient):
         hf_token: str = None,
         batch_size: int = None,
         use_semfedxai: bool = True,
-        knowledge_base: DSM5KnowledgeBase = None
+        knowledge_base: DSM5KnowledgeBase = None,
+        lambda_onto: float = 0.1
     ):
         self.cid = int(cid)
         self.vocab = vocab
@@ -129,16 +132,19 @@ class FlowerClient(fl.client.NumPyClient):
         self.criterion = nn.CrossEntropyLoss()
         self.simulate_failures = simulate_failures
 
-        # Inicialización de componentes semánticos locales (LKE y LE)
+        # Inicialización de componentes semánticos locales (LKE, L_onto y LE)
         self.kb = knowledge_base
+        self.lambda_onto = float(lambda_onto)
         self.enhancer = None
+        self.onto_loss_fn = None
         self.explainer = None
         if self.use_semfedxai:
             try:
                 if self.kb is None:
                     self.kb = DSM5KnowledgeBase(base_dir=self.data_dir)
-                self.enhancer = LocalKnowledgeEnhancer(self.kb)
-                self.explainer = LocalExplainer(self.kb, self.classes)
+                self.enhancer = LocalKnowledgeEnhancer(self.kb, self.classes, self.device)
+                self.onto_loss_fn = OntologyAlignmentLoss(self.enhancer)
+                self.explainer = LocalExplainer(self.kb, self.enhancer, self.classes)
                 _diag(f"cliente {self.cid}: módulos SemFedXAI inicializados con éxito.")
             except Exception as e:
                 _diag(f"cliente {self.cid}: SemFedXAI omitido/error al cargar ontología ({e})")
@@ -214,8 +220,14 @@ class FlowerClient(fl.client.NumPyClient):
             for step, (texts, labels) in enumerate(self.trainloader):
                 texts, labels = texts.to(self.device), labels.to(self.device)
                 self.optimizer.zero_grad()
-                outputs = self.model(texts)
-                loss = self.criterion(outputs, labels)
+                if self.model_type == "hybrid" and self.use_semfedxai and self.onto_loss_fn is not None:
+                    outputs, o_fused, mental_sent = self.model(texts, return_features=True)
+                    loss_ce = self.criterion(outputs, labels)
+                    loss_onto = self.onto_loss_fn(o_fused, labels, mental_sent)
+                    loss = loss_ce + self.lambda_onto * loss_onto
+                else:
+                    outputs = self.model(texts)
+                    loss = self.criterion(outputs, labels)
                 loss.backward()
                 self.optimizer.step()
 
@@ -235,47 +247,59 @@ class FlowerClient(fl.client.NumPyClient):
 
         # Generación de Explicaciones Semánticas Locales (SemFedXAI)
         sem_metrics = {}
-        if self.use_semfedxai and self.explainer is not None:
+        if self.use_semfedxai and self.explainer is not None and self.model_type == "hybrid":
             self.model.eval()
-            all_embeddings = []
-            all_preds = []
-            all_labels = []
+            all_z = []
+            all_logits = []
+            all_sent = []
             count = 0
             with torch.no_grad():
                 for texts, labels in self.valloader:
                     texts, labels = texts.to(self.device), labels.to(self.device)
-                    if self.model_type == "hybrid":
-                        out, _, mental_cls = self.model(texts, return_features=True)
-                        emb = mental_cls.detach().cpu().numpy()
-                    else:
-                        out = self.model(texts)
-                        emb = np.zeros((len(labels), 768), dtype=np.float32)
-                    preds = out.argmax(dim=1).cpu().numpy()
-                    all_embeddings.append(emb)
-                    all_preds.append(preds)
-                    all_labels.append(labels.cpu().numpy())
+                    out, z, sent = self.model(texts, return_features=True)
+                    all_z.append(z)
+                    all_logits.append(out)
+                    all_sent.append(sent)
                     count += len(labels)
                     if count >= 64:
                         break
-            if all_embeddings:
-                cat_emb = np.concatenate(all_embeddings, axis=0)
-                cat_preds = np.concatenate(all_preds, axis=0)
-                cat_labs = np.concatenate(all_labels, axis=0)
-                sem_metrics = self.explainer.explain_client_predictions(cat_emb, cat_preds, cat_labs)
+            if all_z:
+                cat_z = torch.cat(all_z, dim=0)
+                cat_logits = torch.cat(all_logits, dim=0)
+                cat_sent = torch.cat(all_sent, dim=0)
+                sem_metrics = self.explainer.explain(
+                    cat_z,
+                    cat_logits,
+                    cat_sent,
+                    self.model.classify_fused
+                )
 
         accuracy = correct / total_samples if total_samples > 0 else 0.0
         sr_val = float(sem_metrics.get("semantic_relevance", 0.0))
         dc_val = float(sem_metrics.get("domain_consistency", 0.0))
         _diag(f"cliente {self.cid}: fit() fin (acc={accuracy:.2%}, SR={sr_val:.3f}, DC={dc_val:.3f})")
 
-        return self.get_parameters({}), len(self.trainloader.dataset), {
+        # Flower solo acepta en `metrics` valores escalares o listas planas de escalares
+        # (int | float | str | bytes | bool | list[...]); los dicts anidados se envían como JSON string.
+        fit_metrics = {
             "accuracy": float(accuracy),
             "failed": False,
             "semantic_relevance": sr_val,
             "domain_consistency": dc_val,
-            "explanation_vector": sem_metrics.get("explanation_vector", []),
-            "top_criteria": sem_metrics.get("top_criteria_per_class", {})
         }
+        exp_vec = sem_metrics.get("explanation_vector")
+        if exp_vec is not None and len(exp_vec) > 0:
+            fit_metrics["explanation_vector"] = [float(v) for v in exp_vec]
+
+        class_exp = sem_metrics.get("class_explanations")
+        if class_exp is not None:
+            fit_metrics["class_explanations_json"] = json.dumps(class_exp.tolist())
+
+        class_cnt = sem_metrics.get("class_counts")
+        if class_cnt is not None:
+            fit_metrics["class_counts"] = [int(c) for c in class_cnt]
+
+        return self.get_parameters({}), len(self.trainloader.dataset), fit_metrics
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)

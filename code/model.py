@@ -325,6 +325,20 @@ class HybridTransformerClassifier(nn.Module):
             self.melbert.eval()
         return self
 
+    def ids_to_texts(self, x) -> list:
+        """Reconstruye los textos a partir de los IDs del vocabulario (torchtext)."""
+        texts = []
+        vocab_len = len(self.vocab_itos)
+        for seq in x:
+            seq_list = seq.tolist() if hasattr(seq, "tolist") else seq
+            words = [
+                self.vocab_itos[tok]
+                for tok in seq_list
+                if 0 <= tok < vocab_len and self.vocab_itos[tok] not in ("<pad>", "<unk>", None)
+            ]
+            texts.append(" ".join(words) if words else "empty")
+        return texts
+
     def _prepare_inputs(self, x):
         """Convierte entradas (textos o tensores de IDs) en inputs listos para MentalBERT y MelBERT."""
         device = next(self.parameters()).device
@@ -335,16 +349,7 @@ class HybridTransformerClassifier(nn.Module):
         # Caso 2: Tensor de IDs numéricos
         elif isinstance(x, torch.Tensor):
             if self.vocab_itos is not None and len(self.vocab_itos) > 0:
-                texts = []
-                vocab_len = len(self.vocab_itos)
-                for seq in x:
-                    seq_list = seq.tolist() if hasattr(seq, "tolist") else seq
-                    words = [
-                        self.vocab_itos[tok]
-                        for tok in seq_list
-                        if 0 <= tok < vocab_len and self.vocab_itos[tok] not in ("<pad>", "<unk>", None)
-                    ]
-                    texts.append(" ".join(words) if words else "empty")
+                texts = self.ids_to_texts(x)
             else:
                 # Si no hay vocab_itos disponible, clamp estricto para evitar CUDA asserts
                 mental_vocab_size = getattr(self.mental_bert.config, "vocab_size", 30522)
@@ -380,6 +385,19 @@ class HybridTransformerClassifier(nn.Module):
         mel_inputs = {k: v.to(device) for k, v in mel_inputs.items()}
         return mental_inputs, mel_inputs
 
+    def classify_fused(self, o_fused: torch.Tensor) -> torch.Tensor:
+        """Paso 5: Capa de clasificación densamente conectada (768 -> 128 -> num_classes)."""
+        h = self.dropout(self.relu_hidden(self.fc_hidden(o_fused)))
+        return self.classifier(h)
+
+    @staticmethod
+    def mean_pooling(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Mean pooling ponderado por máscara (mismo método usado para criterios_embeddings.npy)."""
+        mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
+        summed = (last_hidden_state * mask).sum(dim=1)
+        counts = mask.sum(dim=1).clamp(min=1e-9)
+        return summed / counts
+
     def forward(self, x, return_features: bool = False):
         mental_inputs, mel_inputs = self._prepare_inputs(x)
 
@@ -400,16 +418,16 @@ class HybridTransformerClassifier(nn.Module):
         o_fused = torch.cat([o_mental, o_mel], dim=1)  # [B, 768]
 
         # Paso 5: Capa de clasificación densamente conectada (768 -> 128 -> num_classes)
-        h = self.dropout(self.relu_hidden(self.fc_hidden(o_fused)))
-        logits = self.classifier(h)
+        logits = self.classify_fused(o_fused)
 
         if return_features:
-            # Representación semántica en R^768 para alineación ontológica con el DSM-5
-            mental_cls = emb_mental[:, 0, :] if emb_mental.ndim == 3 else emb_mental
-            return logits, o_fused, mental_cls
+            # Embedding de frase de MentalBERT (mean pooling), en el mismo espacio que
+            # criterios_embeddings.npy: lo usa el Local Knowledge Enhancer (SemFedXAI).
+            mental_sent = self.mean_pooling(emb_mental, mental_inputs["attention_mask"]).detach()
+            return logits, o_fused, mental_sent
         return logits
 
     def predict_proba(self, x) -> torch.Tensor:
-        """Calcula probabilidades con Softmax sobre las 4 clases."""
+        """Calcula probabilidades con Softmax sobre las clases."""
         logits = self.forward(x)
         return self.softmax(logits)

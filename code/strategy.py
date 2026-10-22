@@ -1,3 +1,5 @@
+import os
+import json
 import numpy as np
 import flwr as fl
 from flwr.server.strategy.aggregate import aggregate
@@ -111,8 +113,8 @@ class SemFedXAIStrategy(CustomStrategy):
         self.data_dir = data_dir
 
         self.kb = knowledge_base or DSM5KnowledgeBase(base_dir=data_dir)
-        self.kg_manager = KnowledgeGraphManager(self.kb)
-        self.expl_generator = ExplanationGenerator(self.kb)
+        self.kg_manager = KnowledgeGraphManager(self.kb, self.class_names)
+        self.expl_generator = ExplanationGenerator(self.kb, self.class_names)
 
         self.history_sr = []
         self.history_dc = []
@@ -139,10 +141,10 @@ class SemFedXAIStrategy(CustomStrategy):
         # 3. Calcular Diversidad Semántica (SD_i)
         K = len(valid_results)
         sd_vals = np.ones(K, dtype=np.float32)
-        has_vectors = len(exp_vectors) == K and len(exp_vectors[0]) > 0
+        has_vectors = K > 0 and all(len(v) > 0 for v in exp_vectors) and len({len(v) for v in exp_vectors}) == 1
+        exp_mat = np.array(exp_vectors, dtype=np.float32) if has_vectors else None
 
         if has_vectors and K > 1:
-            exp_mat = np.array(exp_vectors, dtype=np.float32)
             for i in range(K):
                 other_indices = [j for j in range(K) if j != i]
                 centroid = np.mean(exp_mat[other_indices], axis=0)
@@ -176,8 +178,31 @@ class SemFedXAIStrategy(CustomStrategy):
         parameters_aggregated = ndarrays_to_parameters(aggregated_ndarrays)
 
         # 6. Actualización del Knowledge Graph Manager global
-        if has_vectors:
-            self.kg_manager.update_graph(normalized_weights.tolist(), exp_vectors, server_round)
+        client_class_exps = []
+        client_class_counts = []
+        for r in valid_results:
+            raw_ce = r[1].metrics.get("class_explanations_json")
+            if raw_ce:
+                try:
+                    client_class_exps.append(json.loads(raw_ce))
+                except Exception:
+                    client_class_exps.append([])
+            else:
+                client_class_exps.append([])
+            client_class_counts.append(r[1].metrics.get("class_counts", []))
+
+        if has_vectors and any(len(e) > 0 for e in client_class_exps):
+            self.kg_manager.update_graph(
+                normalized_weights.tolist(),
+                client_class_exps,
+                client_class_counts,
+                server_round
+            )
+            kg_path = os.path.join(self.data_dir or ".", "global_knowledge_graph_latest.ttl")
+            try:
+                self.kg_manager.export_turtle(kg_path)
+            except Exception as e:
+                print(f"⚠️ Error al exportar grafo Turtle: {e}")
 
         # 7. Seguimiento del mejor modelo
         if accuracies:
@@ -205,11 +230,10 @@ class SemFedXAIStrategy(CustomStrategy):
         print(f"Promedios: SR={np.mean(sr_vals):.3f} | DC={np.mean(dc_vals):.3f} | SD={np.mean(sd_vals):.3f}")
 
         # 10. Generación de Explicaciones Clínicas para Médicos/Psicólogos
-        if has_vectors:
-            mean_exp = np.mean(exp_mat, axis=0).tolist()
+        if has_vectors and self.kg_manager.last_round > 0:
             print("\n📋 NARRATIVAS CLÍNICAS EXPLICABLES (Explanation Generator):")
-            for c_name in self.class_names[:2]:  # Mostrar las 2 primeras clases activas
-                narrative = self.expl_generator.generate_clinical_narrative(mean_exp, c_name, top_k=2)
+            for c_idx in range(min(2, len(self.class_names))):
+                narrative = self.expl_generator.global_class_narrative(self.kg_manager, c_idx, top_k=2)
                 print(narrative)
                 print()
         print("=" * 62 + "\n")
