@@ -21,7 +21,8 @@ import flwr as fl
 # Permitir importaciones locales si se corre directamente
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from client import FlowerClient
-from strategy import CustomStrategy
+from strategy import CustomStrategy, SemFedXAIStrategy
+from semantic_modules import DSM5KnowledgeBase
 
 
 def resolve_file(base_dir: str, filename: str) -> str:
@@ -190,7 +191,7 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
             if metrics.get("failed", False) or n_samples == 0:
                 print(f"⚠️ Cliente {cid} reportó fallo; se omite en la agregación.", flush=True)
             else:
-                fit_results.append((new_params, n_samples))
+                fit_results.append((new_params, n_samples, metrics))
                 fit_accs.append(metrics["accuracy"])
                 payload_bytes = sum(p.nbytes for p in new_params)
             del client
@@ -201,7 +202,61 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
         if not fit_results:
             raise RuntimeError("Ningún cliente devolvió resultados válidos en esta ronda.")
 
-        global_params = aggregate(fit_results)
+        if isinstance(strategy, SemFedXAIStrategy):
+            n_samples = np.array([res[1] for res in fit_results], dtype=np.float32)
+            sr_vals = np.array([float(res[2].get("semantic_relevance", 0.0)) for res in fit_results], dtype=np.float32)
+            dc_vals = np.array([float(res[2].get("domain_consistency", 0.0)) for res in fit_results], dtype=np.float32)
+            exp_vectors = [res[2].get("explanation_vector", []) for res in fit_results]
+
+            K = len(fit_results)
+            sd_vals = np.ones(K, dtype=np.float32)
+            has_vectors = len(exp_vectors) == K and len(exp_vectors[0]) > 0
+            if has_vectors and K > 1:
+                exp_mat = np.array(exp_vectors, dtype=np.float32)
+                for i in range(K):
+                    other_centroid = np.mean(np.delete(exp_mat, i, axis=0), axis=0)
+                    norm_i = np.linalg.norm(exp_mat[i])
+                    norm_c = np.linalg.norm(other_centroid)
+                    if norm_i > 1e-6 and norm_c > 1e-6:
+                        sim = float(np.dot(exp_mat[i], other_centroid) / (norm_i * norm_c))
+                        sd_vals[i] = float(np.clip(1.0 - sim, 0.0, 1.0))
+                    else:
+                        sd_vals[i] = 0.5
+
+            raw_w = (
+                n_samples *
+                (1.0 + strategy.alpha * sr_vals) *
+                (1.0 + strategy.beta * dc_vals) *
+                np.power(strategy.gamma, sd_vals)
+            )
+            total_raw = float(np.sum(raw_w))
+            sem_weights = raw_w / (total_raw if total_raw > 0 else 1.0)
+            weighted_fit = [(res[0], float(w)) for res, w in zip(fit_results, sem_weights)]
+            global_params = aggregate(weighted_fit)
+
+            if has_vectors:
+                strategy.kg_manager.update_graph(sem_weights.tolist(), exp_vectors, rnd)
+
+            print(f"\n" + "=" * 62)
+            print(f"🧠 AGREGACIÓN SEMÁNTICA SemFedXAI — RONDA {rnd}".center(62))
+            print("=" * 62)
+            print(f"{'Cliente':<8} | {'Muestras':<8} | {'SR_i':<8} | {'DC_i':<8} | {'SD_i':<8} | {'Peso Sem':<10}")
+            print("-" * 62)
+            for i in range(K):
+                print(f"C_{i:<6} | {int(n_samples[i]):<8} | {sr_vals[i]:<8.3f} | {dc_vals[i]:<8.3f} | {sd_vals[i]:<8.3f} | {sem_weights[i]:<9.2%}")
+            print("-" * 62)
+            print(f"Promedios: SR={np.mean(sr_vals):.3f} | DC={np.mean(dc_vals):.3f} | SD={np.mean(sd_vals):.3f}")
+
+            if has_vectors:
+                mean_exp = np.mean(exp_mat, axis=0).tolist()
+                print("\n📋 NARRATIVAS CLÍNICAS EXPLICABLES (Explanation Generator):")
+                for c_name in strategy.class_names[:2]:
+                    narrative = strategy.expl_generator.generate_clinical_narrative(mean_exp, c_name, top_k=2)
+                    print(narrative)
+                    print()
+            print("=" * 62 + "\n")
+        else:
+            global_params = aggregate([(res[0], res[1]) for res in fit_results])
 
         strategy.payload_mb_per_client = payload_bytes / (1024 ** 2)
         strategy.payload_params_per_client = payload_bytes // 4
@@ -241,7 +296,11 @@ def main(
     simulate_failures: bool = False,
     output_csv: str = None,
     output_plot: str = None,
-    mock_data: bool = False
+    mock_data: bool = False,
+    strategy_name: str = None,
+    alpha: float = None,
+    beta: float = None,
+    gamma: float = None
 ):
     default_data_dir = (
         "/content/drive/My Drive/federated_text_data"
@@ -252,6 +311,10 @@ def main(
     parser.add_argument("--data-dir", type=str, default=default_data_dir, help="Directorio con datos federados")
     parser.add_argument("--num-clients", type=int, default=5, help="Número de clientes federados")
     parser.add_argument("--num-rounds", type=int, default=10, help="Número de rondas de comunicación")
+    parser.add_argument("--strategy", type=str, choices=["semfedxai", "fedavg"], default="semfedxai", help="Estrategia federada ('semfedxai' o 'fedavg')")
+    parser.add_argument("--alpha", type=float, default=0.5, help="SemFedXAI: Ponderación de Relevancia Semántica (SR)")
+    parser.add_argument("--beta", type=float, default=0.5, help="SemFedXAI: Ponderación de Consistencia Ontológica (DC)")
+    parser.add_argument("--gamma", type=float, default=1.2, help="SemFedXAI: Base exponencial para Diversidad Semántica (SD)")
     parser.add_argument("--model-type", type=str, choices=["hybrid", "cnn"], default="hybrid", help="Arquitectura del modelo ('hybrid' o 'cnn')")
     parser.add_argument("--no-freeze-transformers", action="store_true", help="No congelar las capas base de Transformers (por defecto están congeladas para eficiencia federada)")
     parser.add_argument("--max-seq-len", type=int, default=128, help="Longitud máxima de secuencia para los Transformers")
@@ -281,9 +344,21 @@ def main(
         args.output_plot = output_plot
     if mock_data:
         args.mock_data = True
+    if strategy_name is not None:
+        args.strategy = strategy_name
+    if alpha is not None:
+        args.alpha = alpha
+    if beta is not None:
+        args.beta = beta
+    if gamma is not None:
+        args.gamma = gamma
 
     print("==================================================")
     print(" INICIANDO APRENDIZAJE FEDERADO ")
+    if args.strategy == "semfedxai":
+        print(f" ESTRATEGIA: SemFedXAI (α={args.alpha}, β={args.beta}, γ={args.gamma})")
+    else:
+        print(" ESTRATEGIA: FedAvg Convencional (Baseline)")
     if args.model_type == "hybrid":
         print(" MODELO HÍBRIDO (MentalBERT + MelBERT + CNN-1D)")
     else:
@@ -371,6 +446,16 @@ def main(
         snapshot_download(mel_name, token=hf_token)
         print("✅ Archivos de MentalBERT y MelBERT disponibles en la caché local de Hugging Face.")
 
+    # Cargar base de conocimiento ontológica para SemFedXAI
+    kb = None
+    if args.strategy == "semfedxai":
+        try:
+            kb = DSM5KnowledgeBase(base_dir=args.data_dir)
+            print(f"📚 Base de Conocimiento DSM-5 cargada: {len(kb.criteria)} criterios clínicos.")
+        except Exception as e:
+            print(f"⚠️ No se pudo cargar la base ontológica DSM-5 ({e}). Se usará FedAvg estándar.")
+            args.strategy = "fedavg"
+
     # 3. Función generadora de clientes (Celda 12)
     def client_fn(cid: str):
         client = FlowerClient(
@@ -385,12 +470,26 @@ def main(
             shared_models=None,
             max_seq_len=args.max_seq_len,
             hf_token=hf_token,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            use_semfedxai=(args.strategy == "semfedxai"),
+            knowledge_base=kb
         )
         return client.to_client() if hasattr(client, "to_client") else client
 
     # 3. Configuración de Estrategia y Recursos (Celda 12)
-    strategy = CustomStrategy(client_fn=client_fn)
+    if args.strategy == "semfedxai" and kb is not None:
+        strategy = SemFedXAIStrategy(
+            client_fn=client_fn,
+            alpha=args.alpha,
+            beta=args.beta,
+            gamma=args.gamma,
+            knowledge_base=kb,
+            class_names=classes,
+            data_dir=args.data_dir
+        )
+    else:
+        strategy = CustomStrategy(client_fn=client_fn)
+
     client_resources = {
         "num_cpus": 1,
         "num_gpus": 1.0 if torch.cuda.is_available() else 0.0
@@ -409,7 +508,9 @@ def main(
             shared_models=None,
             max_seq_len=args.max_seq_len,
             hf_token=hf_token,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            use_semfedxai=(args.strategy == "semfedxai"),
+            knowledge_base=kb
         )
 
     # Modo hijo del preflight: ejecuta 1 cliente real (2 batches) y termina

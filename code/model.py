@@ -380,7 +380,7 @@ class HybridTransformerClassifier(nn.Module):
         mel_inputs = {k: v.to(device) for k, v in mel_inputs.items()}
         return mental_inputs, mel_inputs
 
-    def forward(self, x) -> torch.Tensor:
+    def forward(self, x, return_features: bool = False):
         mental_inputs, mel_inputs = self._prepare_inputs(x)
 
         # Paso 1 y 2: Generar embeddings contextuales de 768 dimensiones
@@ -402,6 +402,11 @@ class HybridTransformerClassifier(nn.Module):
         # Paso 5: Capa de clasificación densamente conectada (768 -> 128 -> num_classes)
         h = self.dropout(self.relu_hidden(self.fc_hidden(o_fused)))
         logits = self.classifier(h)
+
+        if return_features:
+            # Representación semántica en R^768 para alineación ontológica con el DSM-5
+            mental_cls = emb_mental[:, 0, :] if emb_mental.ndim == 3 else emb_mental
+            return logits, o_fused, mental_cls
         return logits
 
     def predict_proba(self, x) -> torch.Tensor:

@@ -15,6 +15,11 @@ from model import (
     make_collate_fn,
     extract_itos,
 )
+from semantic_modules import (
+    DSM5KnowledgeBase,
+    LocalKnowledgeEnhancer,
+    LocalExplainer,
+)
 
 # Si el proceso muere por un fallo nativo (SIGSEGV/SIGABRT) imprime el traceback de Python
 try:
@@ -58,7 +63,9 @@ class FlowerClient(fl.client.NumPyClient):
         shared_models: dict = None,
         max_seq_len: int = 128,
         hf_token: str = None,
-        batch_size: int = None
+        batch_size: int = None,
+        use_semfedxai: bool = True,
+        knowledge_base: DSM5KnowledgeBase = None
     ):
         self.cid = int(cid)
         self.vocab = vocab
@@ -67,6 +74,7 @@ class FlowerClient(fl.client.NumPyClient):
         self.model_type = model_type
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.pad_idx = vocab['<pad>'] if '<pad>' in vocab else 0
+        self.use_semfedxai = use_semfedxai
 
         if batch_size is not None and batch_size > 0:
             self.batch_size = batch_size
@@ -120,6 +128,20 @@ class FlowerClient(fl.client.NumPyClient):
 
         self.criterion = nn.CrossEntropyLoss()
         self.simulate_failures = simulate_failures
+
+        # Inicialización de componentes semánticos locales (LKE y LE)
+        self.kb = knowledge_base
+        self.enhancer = None
+        self.explainer = None
+        if self.use_semfedxai:
+            try:
+                if self.kb is None:
+                    self.kb = DSM5KnowledgeBase(base_dir=self.data_dir)
+                self.enhancer = LocalKnowledgeEnhancer(self.kb)
+                self.explainer = LocalExplainer(self.kb, self.classes)
+                _diag(f"cliente {self.cid}: módulos SemFedXAI inicializados con éxito.")
+            except Exception as e:
+                _diag(f"cliente {self.cid}: SemFedXAI omitido/error al cargar ontología ({e})")
 
     def _resolve_client_data_path(self):
         """Busca el archivo client_{cid}.npz en la ruta configurada o rutas de fallback."""
@@ -211,9 +233,49 @@ class FlowerClient(fl.client.NumPyClient):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # Generación de Explicaciones Semánticas Locales (SemFedXAI)
+        sem_metrics = {}
+        if self.use_semfedxai and self.explainer is not None:
+            self.model.eval()
+            all_embeddings = []
+            all_preds = []
+            all_labels = []
+            count = 0
+            with torch.no_grad():
+                for texts, labels in self.valloader:
+                    texts, labels = texts.to(self.device), labels.to(self.device)
+                    if self.model_type == "hybrid":
+                        out, _, mental_cls = self.model(texts, return_features=True)
+                        emb = mental_cls.detach().cpu().numpy()
+                    else:
+                        out = self.model(texts)
+                        emb = np.zeros((len(labels), 768), dtype=np.float32)
+                    preds = out.argmax(dim=1).cpu().numpy()
+                    all_embeddings.append(emb)
+                    all_preds.append(preds)
+                    all_labels.append(labels.cpu().numpy())
+                    count += len(labels)
+                    if count >= 64:
+                        break
+            if all_embeddings:
+                cat_emb = np.concatenate(all_embeddings, axis=0)
+                cat_preds = np.concatenate(all_preds, axis=0)
+                cat_labs = np.concatenate(all_labels, axis=0)
+                sem_metrics = self.explainer.explain_client_predictions(cat_emb, cat_preds, cat_labs)
+
         accuracy = correct / total_samples if total_samples > 0 else 0.0
-        _diag(f"cliente {self.cid}: fit() fin (acc={accuracy:.2%})")
-        return self.get_parameters({}), len(self.trainloader.dataset), {"accuracy": accuracy, "failed": False}
+        sr_val = float(sem_metrics.get("semantic_relevance", 0.0))
+        dc_val = float(sem_metrics.get("domain_consistency", 0.0))
+        _diag(f"cliente {self.cid}: fit() fin (acc={accuracy:.2%}, SR={sr_val:.3f}, DC={dc_val:.3f})")
+
+        return self.get_parameters({}), len(self.trainloader.dataset), {
+            "accuracy": float(accuracy),
+            "failed": False,
+            "semantic_relevance": sr_val,
+            "domain_consistency": dc_val,
+            "explanation_vector": sem_metrics.get("explanation_vector", []),
+            "top_criteria": sem_metrics.get("top_criteria_per_class", {})
+        }
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
