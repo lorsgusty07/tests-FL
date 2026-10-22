@@ -43,6 +43,7 @@ class CustomStrategy(fl.server.strategy.FedAvg):
             self.payload_params_per_client = payload_bytes // 4  # float32
 
         if accuracies:
+            self.latest_fit_accuracy = float(np.mean(accuracies))
             best_idx = np.argmax(accuracies)
             best_accuracy = accuracies[best_idx]
 
@@ -61,16 +62,21 @@ class CustomStrategy(fl.server.strategy.FedAvg):
 
     def aggregate_evaluate(self, server_round, results, failures):
         """Calcula Accuracy y Tráfico de Red Real."""
-        # 1. Accuracy promedio
+        # 1. Accuracy promedio (si evaluate no fue muestreado por Flower, usa el promedio de fit de la ronda)
         accuracies = [r.metrics["accuracy"] for _, r in results if "accuracy" in r.metrics]
-        avg_accuracy = float(np.mean(accuracies)) if accuracies else 0.0
+        if accuracies:
+            avg_accuracy = float(np.mean(accuracies))
+        elif getattr(self, "latest_fit_accuracy", 0.0) > 0.0:
+            avg_accuracy = self.latest_fit_accuracy
+        else:
+            avg_accuracy = 0.0
         self.history_accuracy.append(avg_accuracy)
 
         # 2. CÁLCULO DE RED REAL
         total_mb_round = 0.0
         if self.payload_mb_per_client > 0:
-            # Tráfico: Clientes que respondieron * peso comunicado * 2 (ida y vuelta)
-            total_mb_round = len(results) * self.payload_mb_per_client * 2
+            n_clients = len(results) if len(results) > 0 else getattr(self, "latest_num_clients", 12)
+            total_mb_round = n_clients * self.payload_mb_per_client * 2
             self.history_network_mb.append(total_mb_round)
 
         # 3. Log para consola
@@ -205,7 +211,9 @@ class SemFedXAIStrategy(CustomStrategy):
                 print(f"⚠️ Error al exportar grafo Turtle: {e}")
 
         # 7. Seguimiento del mejor modelo
+        self.latest_num_clients = len(valid_results)
         if accuracies:
+            self.latest_fit_accuracy = float(np.mean(accuracies))
             best_idx = np.argmax(accuracies)
             best_accuracy = accuracies[best_idx]
             if best_accuracy > self.best_accuracy:
