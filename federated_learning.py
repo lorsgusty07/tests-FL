@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Script de Aprendizaje Federado extraído y depurado desde Aprendizaje_Federado.ipynb.
-Contiene exclusivamente las celdas funcionales para el entrenamiento federado (celdas 9 a 14),
-omitiendo celdas experimentales descartadas, comandos de Colab y código obsoleto.
+Pipeline de Aprendizaje Federado para clasificacion de texto con Flower y PyTorch.
+Modelo baseline denso (CNN).
 """
 
 import os
@@ -21,7 +20,7 @@ import flwr as fl
 
 
 # =====================================================================
-# 1. Dataset y Arquitectura del Modelo (Celda 10)
+# Dataset y Arquitectura del Modelo
 # =====================================================================
 class TextDataset(Dataset):
     """Clase Dataset compartida por todos los clientes federados."""
@@ -77,7 +76,7 @@ class CNNTextClassifier(nn.Module):
 
 
 # =====================================================================
-# 2. Cliente Federado Flower (Celda 11)
+# Cliente Federado Flower
 # =====================================================================
 class FlowerClient(fl.client.NumPyClient):
     """Cliente federado Flower para entrenamiento local y cálculo de tráfico de red."""
@@ -212,7 +211,7 @@ class FlowerClient(fl.client.NumPyClient):
 
 
 # =====================================================================
-# 3. Estrategia del Servidor Personalizada (Celda 12)
+# Estrategia del Servidor Personalizada
 # =====================================================================
 class CustomStrategy(fl.server.strategy.FedAvg):
     """Estrategia personalizada que calcula métricas y sobrecarga de comunicación."""
@@ -235,7 +234,7 @@ class CustomStrategy(fl.server.strategy.FedAvg):
             if best_accuracy > self.best_accuracy:
                 self.best_accuracy = best_accuracy
                 self.best_model = valid_results[best_idx][1].parameters
-                print(f"✅ Nuevo mejor modelo (Accuracy: {best_accuracy:.2%})")
+                print(f"[INFO] Nuevo mejor modelo (Accuracy: {best_accuracy:.2%})")
 
         return super().aggregate_fit(server_round, results, failures)
 
@@ -259,9 +258,9 @@ class CustomStrategy(fl.server.strategy.FedAvg):
                 self.history_network_mb.append(total_mb_round)
 
         print(f"--- Ronda {server_round} ---")
-        print(f"📈 Accuracy: {avg_accuracy:.2%}")
+        print(f"Accuracy: {avg_accuracy:.2%}")
         if total_mb_round > 0:
-            print(f"📡 Tráfico Red: {total_mb_round:.2f} MB (Modelo DENSO)")
+            print(f"Trafico de Red: {total_mb_round:.2f} MB (Modelo DENSO)")
         print("-" * 20)
 
         loss_aggregated, _ = super().aggregate_evaluate(server_round, results, failures)
@@ -346,7 +345,7 @@ def load_vocab(vocab_path: str):
 
 
 # =====================================================================
-# 4. Orquestación y Ejecución de la Simulación (Celdas 9, 12, 13, 14)
+# Orquestacion y Ejecucion de la Simulacion
 # =====================================================================
 def run_federated_learning(
     data_dir: str = None,
@@ -397,7 +396,7 @@ def run_federated_learning(
         os.makedirs(args.data_dir, exist_ok=True)
         metadata_path = os.path.join(args.data_dir, "label_metadata.npz")
         vocab_path = os.path.join(args.data_dir, "vocab.pkl")
-        print(f"🔧 Generando datos sintéticos de prueba en: {args.data_dir}...")
+        print(f"[INFO] Generando datos sintéticos de prueba en: {args.data_dir}...")
         
         vocab = {"<pad>": 0, "<unk>": 1}
         for w in range(2, 500):
@@ -413,7 +412,7 @@ def run_federated_learning(
             dummy_texts = [np.random.randint(1, 500, size=np.random.randint(10, 30)) for _ in range(n_samples)]
             dummy_labels = np.random.randint(0, 2, size=n_samples)
             np.savez(os.path.join(args.data_dir, f"client_{cid}.npz"), texts=np.array(dummy_texts, dtype=object), labels=dummy_labels)
-        print("✅ Datos sintéticos de prueba generados exitosamente.\n")
+        print("[INFO] Datos sintéticos de prueba generados exitosamente.\n")
 
     # Resolución de archivos de metadatos y vocabulario
     def find_file(name):
@@ -433,13 +432,13 @@ def run_federated_learning(
     vocab_path = find_file("vocab.pkl")
 
     if not os.path.exists(metadata_path) or not os.path.exists(vocab_path):
-        print(f"❌ Error: Archivos no encontrados.")
+        print(f"[ERROR] Archivos no encontrados.")
         print(f"   Metadata buscado en: {metadata_path}")
         print(f"   Vocabulario buscado en: {vocab_path}")
         print("Asegúrate de indicar la ruta correcta con --data-dir.")
         sys.exit(1)
 
-    print(f"📂 Cargando metadatos: {metadata_path}")
+    print(f"[INFO] Cargando metadatos: {metadata_path}")
     label_metadata = np.load(metadata_path, allow_pickle=True)
     vocab = load_vocab(vocab_path)
 
@@ -458,8 +457,8 @@ def run_federated_learning(
                         if m >= global_vocab_size:
                             global_vocab_size = m + 1
 
-    print(f"✅ Vocabulario cargado ({len(vocab)} tokens). Clases detectadas: {len(classes)}")
-    print(f"📊 Tamaño efectivo del vocabulario para la CNN: {global_vocab_size}")
+    print(f"[INFO] Vocabulario cargado ({len(vocab)} tokens). Clases detectadas: {len(classes)}")
+    print(f"[INFO] Tamaño efectivo del vocabulario para la CNN: {global_vocab_size}")
 
     # Función generadora de cliente
     def client_fn(cid: str):
@@ -480,7 +479,7 @@ def run_federated_learning(
     }
 
     # Iniciar simulación Flower
-    print(f"\n🚀 Lanzando simulación ({args.num_clients} clientes, {args.num_rounds} rondas)...")
+    print(f"\n[INFO] Lanzando simulación ({args.num_clients} clientes, {args.num_rounds} rondas)...")
     fl.simulation.start_simulation(
         client_fn=client_fn,
         num_clients=args.num_clients,
@@ -489,9 +488,9 @@ def run_federated_learning(
         client_resources=client_resources
     )
 
-    # Reporte técnico (Celda 12)
+    # Reporte técnico
     print("\n" + "=" * 50)
-    print("📡 MÉTRICAS DE RED: MODELO DENSO (BASELINE)".center(50))
+    print("MÉTRICAS DE RED: MODELO DENSO (BASELINE)".center(50))
     print("=" * 50)
 
     test_client = FlowerClient(0, vocab=vocab, classes=classes, data_dir=args.data_dir, vocab_size=global_vocab_size)
@@ -511,7 +510,7 @@ def run_federated_learning(
     print("   - Cada comunicación transmite el modelo completo.")
     print("=" * 50)
 
-    # Generar y guardar gráfica (Celda 13)
+    # Generar y guardar gráfica
     if strategy.history_accuracy:
         plt.figure(figsize=(10, 5))
         plt.plot(range(1, len(strategy.history_accuracy) + 1), strategy.history_accuracy, 'b-o', label='Precisión Promedio')
@@ -522,16 +521,16 @@ def run_federated_learning(
         plt.legend()
         plt.tight_layout()
         plt.savefig(args.output_plot)
-        print(f"\n📊 Gráfica guardada en: {args.output_plot}")
+        print(f"\n[INFO] Gráfica guardada en: {args.output_plot}")
 
-    # Guardar CSV de precisión por ronda (Celda 14)
+    # Guardar CSV de precisión por ronda
     if strategy.history_accuracy:
         df_precision = pd.DataFrame({
             "Ronda de Comunicación": list(range(1, len(strategy.history_accuracy) + 1)),
             "Precisión": strategy.history_accuracy
         })
         df_precision.to_csv(args.output_csv, index=False)
-        print(f"📄 Archivo CSV guardado en: {args.output_csv}")
+        print(f"[INFO] Archivo CSV guardado en: {args.output_csv}")
         print("\nResultados por ronda:")
         print(df_precision.to_string(index=False))
 
