@@ -167,7 +167,7 @@ def count_backbone_params(hf_token: str = None) -> int:
             total += sum(p.numel() for p in m.parameters())
         return total
     except Exception as e:
-        print(f"⚠️ No se pudo contar los parámetros de los backbones: {e}")
+        print(f"[WARN] No se pudo contar los parámetros de los backbones: {e}")
         return 0
 
 
@@ -190,7 +190,7 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
             client = build_client(cid)
             new_params, n_samples, metrics = client.fit(global_params, {})
             if metrics.get("failed", False) or n_samples == 0:
-                print(f"⚠️ Cliente {cid} reportó fallo; se omite en la agregación.", flush=True)
+                print(f"[WARN] Cliente {cid} reportó fallo; se omite en la agregación.", flush=True)
             else:
                 fit_results.append((new_params, n_samples, metrics))
                 fit_accs.append(metrics["accuracy"])
@@ -259,10 +259,10 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
                 try:
                     strategy.kg_manager.export_turtle(kg_file)
                 except Exception as e:
-                    print(f"⚠️ Error al exportar grafo Turtle: {e}")
+                    print(f"[WARN] Error al exportar grafo Turtle: {e}")
 
             print(f"\n" + "=" * 62)
-            print(f"🧠 AGREGACIÓN SEMÁNTICA SemFedXAI — RONDA {rnd}".center(62))
+            print(f"AGREGACIÓN SEMÁNTICA SemFedXAI — RONDA {rnd}".center(62))
             print("=" * 62)
             print(f"{'Cliente':<8} | {'Muestras':<8} | {'SR_i':<8} | {'DC_i':<8} | {'SD_i':<8} | {'Peso Sem':<10}")
             print("-" * 62)
@@ -272,7 +272,7 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
             print(f"Promedios: SR={np.mean(sr_vals):.3f} | DC={np.mean(dc_vals):.3f} | SD={np.mean(sd_vals):.3f}")
 
             if has_vectors and strategy.kg_manager.last_round > 0:
-                print("\n📋 NARRATIVAS CLÍNICAS EXPLICABLES (Explanation Generator):")
+                print("\nNARRATIVAS CLÍNICAS EXPLICABLES (Explanation Generator):")
                 for c_idx in range(min(2, len(strategy.class_names))):
                     narrative = strategy.expl_generator.global_class_narrative(strategy.kg_manager, c_idx, top_k=2)
                     print(narrative)
@@ -286,7 +286,7 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
         best_acc = max(fit_accs)
         if best_acc > strategy.best_accuracy:
             strategy.best_accuracy = best_acc
-            print(f"✅ Nuevo mejor modelo (Accuracy: {best_acc:.2%})", flush=True)
+            print(f"[INFO] Nuevo mejor modelo (Accuracy: {best_acc:.2%})", flush=True)
 
         eval_accs, eval_losses = [], []
         for cid in range(num_clients):
@@ -305,8 +305,8 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
         strategy.history_network_mb.append(total_mb_round)
 
         print(f"--- Ronda {rnd} ---")
-        print(f"📈 Accuracy: {avg_acc:.2%}  (loss media: {float(np.mean(eval_losses)):.4f})")
-        print(f"📡 Tráfico Red: {total_mb_round:.2f} MB")
+        print(f"Accuracy: {avg_acc:.2%}  (loss media: {float(np.mean(eval_losses)):.4f})")
+        print(f"Tráfico Red: {total_mb_round:.2f} MB")
         print("-" * 20, flush=True)
 
     return global_params
@@ -397,7 +397,7 @@ def main(
         os.makedirs(args.data_dir, exist_ok=True)
         metadata_path = os.path.join(args.data_dir, "label_metadata.npz")
         vocab_path = os.path.join(args.data_dir, "vocab.pkl")
-        print(f"🔧 Generando datos sintéticos de prueba en: {args.data_dir}...")
+        print(f"[INFO] Generando datos sintéticos de prueba en: {args.data_dir}...")
         
         vocab = {"<pad>": 0, "<unk>": 1}
         for w in range(2, 500):
@@ -413,25 +413,25 @@ def main(
             dummy_texts = [np.random.randint(1, 500, size=np.random.randint(10, 30)) for _ in range(n_samples)]
             dummy_labels = np.random.randint(0, len(classes), size=n_samples)
             np.savez(os.path.join(args.data_dir, f"client_{cid}.npz"), texts=np.array(dummy_texts, dtype=object), labels=dummy_labels)
-        print("✅ Datos sintéticos de prueba generados exitosamente.\n")
+        print("[INFO] Datos sintéticos de prueba generados exitosamente.\n")
 
-    # 1. Cargar metadatos y vocabulario (Celda 9)
+    # Cargar metadatos y vocabulario
     metadata_path = resolve_file(args.data_dir, "label_metadata.npz")
     vocab_path = resolve_file(args.data_dir, "vocab.pkl")
 
     if not os.path.exists(metadata_path) or not os.path.exists(vocab_path):
-        print(f"❌ Error: Archivos no encontrados en {args.data_dir}.")
+        print(f"[ERROR] Archivos no encontrados en {args.data_dir}.")
         print(f"   Metadata buscado en: {metadata_path}")
         print(f"   Vocab buscado en: {vocab_path}")
         sys.exit(1)
 
-    print(f"📂 Cargando metadatos desde: {metadata_path}")
+    print(f"[INFO] Cargando metadatos desde: {metadata_path}")
     label_metadata = np.load(metadata_path, allow_pickle=True)
     vocab = load_vocab(vocab_path)
 
     classes = label_metadata["classes"].tolist()
 
-    # 2. Calcular vocab_size global seguro verificando tokens en los clientes
+    # Calcular vocab_size global seguro verificando tokens en los clientes
     global_vocab_size = len(vocab)
     for cid in range(args.num_clients):
         c_path = resolve_file(args.data_dir, f"client_{cid}.npz")
@@ -444,8 +444,8 @@ def main(
                         if m >= global_vocab_size:
                             global_vocab_size = m + 1
 
-    print(f"✅ Vocabulario cargado ({len(vocab)} tokens). Clases: {len(classes)} ({classes})")
-    print(f"📊 Modelo seleccionado: {args.model_type.upper()}")
+    print(f"[INFO] Vocabulario cargado ({len(vocab)} tokens). Clases: {len(classes)} ({classes})")
+    print(f"[INFO] Modelo seleccionado: {args.model_type.upper()}")
 
     # Pre-descargar modelos base si se usa la arquitectura híbrida
     hf_token = args.hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
@@ -454,7 +454,7 @@ def main(
             try:
                 import huggingface_hub
                 huggingface_hub.login(token=hf_token, add_to_git_credential=False)
-                print("🔑 Autenticación con Hugging Face exitosa.")
+                print("[INFO] Autenticación con Hugging Face exitosa.")
             except Exception:
                 pass
 
@@ -462,28 +462,28 @@ def main(
             import transformers  # noqa: F401  (solo verifica que esté instalado)
         except ImportError:
             import subprocess
-            print("📦 transformers no detectado. Instalando automáticamente...")
+            print("[INFO] transformers no detectado. Instalando automáticamente...")
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "transformers", "accelerate"])
 
         from huggingface_hub import snapshot_download
-        print("⏳ Descargando / verificando archivos de MentalBERT y MelBERT (sin cargarlos en RAM del proceso principal)...")
+        print("[INFO] Descargando / verificando archivos de MentalBERT y MelBERT...")
         mental_name = "mental/mental-bert-base-uncased"
         mel_name = "EhsanAghazadeh/melbert-roberta"
         snapshot_download(mental_name, token=hf_token)
         snapshot_download(mel_name, token=hf_token)
-        print("✅ Archivos de MentalBERT y MelBERT disponibles en la caché local de Hugging Face.")
+        print("[INFO] Archivos de MentalBERT y MelBERT disponibles en la caché local.")
 
     # Cargar base de conocimiento ontológica para SemFedXAI
     kb = None
     if args.strategy == "semfedxai":
         try:
             kb = DSM5KnowledgeBase(base_dir=args.data_dir)
-            print(f"📚 Base de Conocimiento DSM-5 cargada: {len(kb.criteria)} criterios clínicos.")
+            print(f"[INFO] Base de Conocimiento DSM-5 cargada: {len(kb.criteria)} criterios clínicos.")
         except Exception as e:
-            print(f"⚠️ No se pudo cargar la base ontológica DSM-5 ({e}). Se usará FedAvg estándar.")
+            print(f"[WARN] No se pudo cargar la base ontológica DSM-5 ({e}). Se usará FedAvg estándar.")
             args.strategy = "fedavg"
 
-    # 3. Función generadora de clientes (Celda 12)
+    # Generador de clientes
     def client_fn(cid: str):
         client = FlowerClient(
             cid=int(cid),
@@ -504,7 +504,7 @@ def main(
         )
         return client.to_client() if hasattr(client, "to_client") else client
 
-    # 3. Configuración de Estrategia y Recursos (Celda 12)
+    # Configuracion de estrategia y recursos
     if args.strategy == "semfedxai" and kb is not None:
         strategy = SemFedXAIStrategy(
             client_fn=client_fn,
@@ -544,19 +544,19 @@ def main(
 
     # Modo hijo del preflight: ejecuta 1 cliente real (2 batches) y termina
     if args.preflight_child:
-        print("🧪 [preflight] construyendo cliente 0 y ejecutando 2 batches...", flush=True)
+        print("[INFO] [preflight] construyendo cliente 0 y ejecutando 2 batches...", flush=True)
         c = build_numpy_client(0)
         p = c.get_parameters({})
         c.fit(p, {"max_batches": 2})
         c.evaluate(p, {})
-        print("✅ PREFLIGHT OK: el pipeline completo funciona en un proceso aislado.", flush=True)
+        print("[INFO] Preflight completado exitosamente.", flush=True)
         return
 
     # Preflight: si el proceso muere aquí, se ve la causa real (en vez de la cascada de Ray)
     if (not args.no_ray and not args.skip_preflight and args.model_type == "hybrid"
             and os.path.basename(sys.argv[0]) == "main.py"):
         import subprocess
-        print("\n🧪 Preflight: probando 1 cliente en un subproceso aislado antes de lanzar Ray...", flush=True)
+        print("\n[INFO] Preflight: probando 1 cliente en un subproceso aislado antes de lanzar Ray...", flush=True)
         cmd = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:] + ["--preflight-child"]
         rc = subprocess.run(cmd).returncode
         if rc != 0:
@@ -569,19 +569,19 @@ def main(
                 134: "SIGABRT: abort nativo (suele ser CUDA/driver o una aserción de librería).",
             }
             print("\n" + "=" * 60)
-            print(f"❌ PREFLIGHT FALLÓ (código de salida {rc}).")
+            print(f"[ERROR] Preflight falló (código de salida {rc}).")
             print(f"   Causa probable: {causas.get(rc, 'excepción de Python; revisa el traceback impreso arriba.')}")
             print("   Se aborta antes de lanzar Ray para no inundar la consola con 'ActorPool is empty'.")
             print("   Pega las líneas '[diag ...]' y el traceback de arriba para localizar el punto exacto.")
             print("=" * 60)
             sys.exit(1)
-        print("✅ Preflight correcto. Lanzando la simulación con Ray...\n", flush=True)
+        print("[INFO] Preflight correcto. Lanzando la simulación con Ray...\n", flush=True)
 
     if args.no_ray:
-        print(f"\n🚀 Iniciando FedAvg SECUENCIAL (sin Ray) con {args.num_clients} clientes por {args.num_rounds} rondas...")
+        print(f"\n[INFO] Iniciando FedAvg secuencial (sin Ray) con {args.num_clients} clientes por {args.num_rounds} rondas...")
         run_sequential(build_numpy_client, strategy, args.num_clients, args.num_rounds)
     else:
-        print(f"\n🚀 Iniciando simulación con {args.num_clients} clientes por {args.num_rounds} rondas...")
+        print(f"\n[INFO] Iniciando simulación con {args.num_clients} clientes por {args.num_rounds} rondas...")
         fl.simulation.start_simulation(
             client_fn=client_fn,
             num_clients=args.num_clients,
@@ -604,7 +604,7 @@ def main(
         # Si ningún cliente logró completar un fit, los workers de Ray murieron: se reintenta sin Ray
         if strategy.payload_params_per_client == 0:
             print("\n" + "=" * 60)
-            print("⚠️ Ray no completó ningún entrenamiento (los workers murieron).")
+            print("[WARN] Los workers de Ray no completaron el entrenamiento.")
             print("   Reintentando automáticamente con FedAvg secuencial SIN Ray...")
             print("=" * 60, flush=True)
             try:
@@ -617,9 +617,9 @@ def main(
             strategy.best_accuracy = 0.0
             run_sequential(build_numpy_client, strategy, args.num_clients, args.num_rounds)
 
-    # 4. Reporte Técnico Real (Celda 12)
+    # Metricas de red
     print("\n" + "=" * 50)
-    print("📡 MÉTRICAS DE RED: APRENDIZAJE FEDERADO".center(50))
+    print("MÉTRICAS DE RED: APRENDIZAJE FEDERADO".center(50))
     print("=" * 50)
 
     # Todo se calcula con el payload real medido en aggregate_fit; no se instancia ningún modelo en el driver
@@ -639,12 +639,12 @@ def main(
     print(f"   - Payload por cliente (Subida): {mb_round:.2f} MB")
     print(f"   - Tráfico total en la simulación: {total_transmision_mb:.2f} MB")
 
-    print("\n3. Estado para el Workshop:")
+    print("\n3. Configuración de Comunicación:")
     print("   - Los backbones MentalBERT/MelBERT están congelados y NO se transmiten.")
     print("   - Cada comunicación transmite solo las CNN-1D + capas densas.")
     print("=" * 50)
 
-    # 5. Visualización de Resultados (Celda 13)
+    # Visualización de Resultados
     if strategy.history_accuracy:
         plt.figure(figsize=(10, 5))
         plt.plot(range(1, len(strategy.history_accuracy) + 1), strategy.history_accuracy, 'b-o', label='Precisión Promedio')
@@ -655,16 +655,16 @@ def main(
         plt.legend()
         plt.tight_layout()
         plt.savefig(args.output_plot)
-        print(f"\n📊 Gráfica de evolución guardada en: {args.output_plot}")
+        print(f"\n[INFO] Gráfica de evolución guardada en: {args.output_plot}")
 
-    # 6. Exportación de métricas a CSV (Celda 14)
+    # Exportación de métricas a CSV
     if strategy.history_accuracy:
         df_precision = pd.DataFrame({
             "Ronda de Comunicación": list(range(1, len(strategy.history_accuracy) + 1)),
             "Precisión": strategy.history_accuracy
         })
         df_precision.to_csv(args.output_csv, index=False)
-        print(f"📄 Tabla de precisión exportada a: {args.output_csv}")
+        print(f"[INFO] Tabla de precisión exportada a: {args.output_csv}")
         print("\nResumen de precisión por ronda:")
         print(df_precision.to_string(index=False))
 

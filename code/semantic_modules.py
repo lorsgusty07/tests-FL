@@ -186,7 +186,7 @@ class DSM5KnowledgeBase:
         """Lee las relaciones med:hasCriterion desde dsm5_ontologia.ttl (rdflib o parser propio)."""
         if not os.path.exists(self.ttl_path):
             if self.verbose:
-                print(f"⚠️ Ontología no encontrada ({self.ttl_path}); se usa la agrupación de criterios_ids.json")
+                print(f"[WARN] Ontología no encontrada ({self.ttl_path}); se usa la agrupación de criterios_ids.json")
             return
         relations, labels = self._parse_ttl(self.ttl_path)
         mapping = {}
@@ -200,7 +200,7 @@ class DSM5KnowledgeBase:
             self.ontology_source = "ttl"
             if self.verbose:
                 n_rel = sum(len(v) for v in mapping.values())
-                print(f"🧬 Ontología DSM-5 cargada desde TTL: {len(mapping)} trastornos, {n_rel} relaciones hasCriterion")
+                print(f"[INFO] Ontología DSM-5 cargada desde TTL: {len(mapping)} trastornos, {n_rel} relaciones hasCriterion")
 
     @staticmethod
     def _parse_ttl(path: str):
@@ -219,7 +219,7 @@ class DSM5KnowledgeBase:
         except ImportError:
             pass
         except Exception as e:
-            print(f"⚠️ rdflib no pudo leer la ontología ({e}); se usa el parser de respaldo.")
+            print(f"[WARN] rdflib no pudo leer la ontología ({e}); se usa el parser de respaldo.")
 
         # Parser de respaldo (estructura de bloques del TTL generado)
         with open(path, "r", encoding="utf-8") as f:
@@ -252,7 +252,7 @@ class DSM5KnowledgeBase:
                     if syms:
                         self.criterion_symptoms[c["id"]] = sorted(syms, key=lambda s: -s["confidence"])
         except Exception as e:
-            print(f"⚠️ No se pudieron cargar los síntomas HPO ({e})")
+            print(f"[WARN] No se pudieron cargar los síntomas HPO ({e})")
 
     # ---------------- consultas ----------------
     def symptoms_for(self, criterion_idx: int, top: int = 3) -> list:
@@ -280,7 +280,7 @@ class DSM5KnowledgeBase:
                 token = norm.replace(" ", "_")
                 dis = [d for d in self.disorder_to_criteria_indices if token in d.lower()]
                 if not dis and self.verbose:
-                    print(f"⚠️ Clase '{name}' sin mapeo en el DSM-5: se trata como clase sin prototipo.")
+                    print(f"[WARN] Clase '{name}' sin mapeo en el DSM-5: se trata como clase sin prototipo.")
             else:
                 dis = [d for d in spec.get("disorders", []) if d in self.disorder_to_criteria_indices]
                 for c_id in spec.get("criteria", []):
@@ -610,10 +610,10 @@ class ExplanationGenerator:
         name = self.class_names[class_idx]
         idxs = kgm.top_criteria_for_class(class_idx, top_k)
         if not idxs:
-            return f"🩺 {name}: sin predicciones en esta ronda."
-        head = (f"🩺 Clase '{name}' — criterios DSM-5 con mayor atribución global:"
+            return f"{name}: sin predicciones en esta ronda."
+        head = (f"Clase '{name}' — criterios DSM-5 con mayor atribución global:"
                 if self.info["has_proto"][class_idx]
-                else f"🩺 Clase '{name}' (control, sin trastorno DSM-5) — criterios más atribuidos (referencia):")
+                else f"Clase '{name}' (control, sin trastorno DSM-5) — criterios más atribuidos (referencia):")
         lines = [head]
         for r, i in enumerate(idxs, 1):
             lines.extend(self._criterion_lines(r, i, float(kgm.class_importance[class_idx, i]), class_idx))
@@ -622,7 +622,7 @@ class ExplanationGenerator:
     def instance_narrative(self, text: str, pred_idx: int, prob: float, crit_idxs: list, scores: list) -> str:
         name = self.class_names[pred_idx]
         snippet = text[:220] + "..." if len(text) > 220 else text
-        lines = [f"🩺 Predicción: {name} (confianza {prob:.1%})", f'   Texto (extracto): "{snippet}"']
+        lines = [f"Predicción: {name} (confianza {prob:.1%})", f'   Texto (extracto): "{snippet}"']
         if not self.info["has_proto"][pred_idx]:
             lines.append("   Clase de control: no corresponde a un trastorno del DSM-5. "
                          "Criterios con mayor atribución (sólo referencia):")

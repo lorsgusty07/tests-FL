@@ -50,7 +50,7 @@ class CustomStrategy(fl.server.strategy.FedAvg):
             if best_accuracy > self.best_accuracy:
                 self.best_accuracy = best_accuracy
                 self.best_model = valid_results[best_idx][1].parameters
-                print(f"✅ Nuevo mejor modelo (Accuracy: {best_accuracy:.2%})")
+                print(f"[INFO] Nuevo mejor modelo (Accuracy: {best_accuracy:.2%})")
 
         return super().aggregate_fit(server_round, valid_results, failures)
 
@@ -72,18 +72,18 @@ class CustomStrategy(fl.server.strategy.FedAvg):
             avg_accuracy = 0.0
         self.history_accuracy.append(avg_accuracy)
 
-        # 2. CÁLCULO DE RED REAL
+        # Calculo de trafico de red
         total_mb_round = 0.0
         if self.payload_mb_per_client > 0:
             n_clients = len(results) if len(results) > 0 else getattr(self, "latest_num_clients", 12)
             total_mb_round = n_clients * self.payload_mb_per_client * 2
             self.history_network_mb.append(total_mb_round)
 
-        # 3. Log para consola
+        # Registro en consola
         print(f"--- Ronda {server_round} ---")
-        print(f"📈 Accuracy: {avg_accuracy:.2%}")
+        print(f"Accuracy: {avg_accuracy:.2%}")
         if total_mb_round > 0:
-            print(f"📡 Tráfico Red: {total_mb_round:.2f} MB")
+            print(f"Trafico de Red: {total_mb_round:.2f} MB")
         print("-" * 20)
 
         loss_aggregated, _ = super().aggregate_evaluate(server_round, results, failures)
@@ -131,20 +131,20 @@ class SemFedXAIStrategy(CustomStrategy):
         if not valid_results:
             return None, {}
 
-        # 1. Medir carga de red comunicada
+        # Medir carga de red comunicada
         first_params = valid_results[0][1].parameters
         payload_bytes = sum(len(t) for t in first_params.tensors)
         self.payload_mb_per_client = payload_bytes / (1024 ** 2)
         self.payload_params_per_client = payload_bytes // 4
 
-        # 2. Extraer métricas semánticas enviadas por los clientes
+        # Metricas semanticas de clientes
         n_samples = np.array([r[1].num_examples for r in valid_results], dtype=np.float32)
         accuracies = [r[1].metrics.get("accuracy", 0.0) for r in valid_results]
         sr_vals = np.array([float(r[1].metrics.get("semantic_relevance", 0.0)) for r in valid_results], dtype=np.float32)
         dc_vals = np.array([float(r[1].metrics.get("domain_consistency", 0.0)) for r in valid_results], dtype=np.float32)
         exp_vectors = [r[1].metrics.get("explanation_vector", []) for r in valid_results]
 
-        # 3. Calcular Diversidad Semántica (SD_i)
+        # Calculo de Diversidad Semantica (SD_i)
         K = len(valid_results)
         sd_vals = np.ones(K, dtype=np.float32)
         has_vectors = K > 0 and all(len(v) > 0 for v in exp_vectors) and len({len(v) for v in exp_vectors}) == 1
@@ -164,7 +164,7 @@ class SemFedXAIStrategy(CustomStrategy):
         elif K == 1:
             sd_vals[0] = 1.0
 
-        # 4. Fórmula de Ponderación Semántica SemFedXAI
+        # Ponderacion Semantica SemFedXAI
         # w_i^sem = n_i * (1 + alpha * SR_i) * (1 + beta * DC_i) * (gamma ^ SD_i)
         raw_sem_weights = (
             n_samples *
@@ -175,7 +175,7 @@ class SemFedXAIStrategy(CustomStrategy):
         total_w = float(np.sum(raw_sem_weights))
         normalized_weights = raw_sem_weights / (total_w if total_w > 0 else 1.0)
 
-        # 5. Agregación ponderada con los pesos semánticos calculados
+        # Agregacion ponderada con los pesos semanticos calculados
         weights_results = [
             (parameters_to_ndarrays(r[1].parameters), float(w))
             for r, w in zip(valid_results, normalized_weights)
@@ -183,7 +183,7 @@ class SemFedXAIStrategy(CustomStrategy):
         aggregated_ndarrays = aggregate(weights_results)
         parameters_aggregated = ndarrays_to_parameters(aggregated_ndarrays)
 
-        # 6. Actualización del Knowledge Graph Manager global
+        # Actualizacion del Knowledge Graph Manager global
         client_class_exps = []
         client_class_counts = []
         for r in valid_results:
@@ -208,9 +208,9 @@ class SemFedXAIStrategy(CustomStrategy):
             try:
                 self.kg_manager.export_turtle(kg_path)
             except Exception as e:
-                print(f"⚠️ Error al exportar grafo Turtle: {e}")
+                print(f"[WARN] Error al exportar grafo Turtle: {e}")
 
-        # 7. Seguimiento del mejor modelo
+        # Seguimiento del mejor modelo
         self.latest_num_clients = len(valid_results)
         if accuracies:
             self.latest_fit_accuracy = float(np.mean(accuracies))
@@ -219,16 +219,16 @@ class SemFedXAIStrategy(CustomStrategy):
             if best_accuracy > self.best_accuracy:
                 self.best_accuracy = best_accuracy
                 self.best_model = parameters_aggregated
-                print(f"✅ Nuevo mejor modelo global SemFedXAI (Accuracy: {best_accuracy:.2%})")
+                print(f"[INFO] Nuevo mejor modelo global SemFedXAI (Accuracy: {best_accuracy:.2%})")
 
-        # 8. Registro de métricas históricas
+        # Registro de metricas historicas
         self.history_sr.append(float(np.mean(sr_vals)))
         self.history_dc.append(float(np.mean(dc_vals)))
         self.history_sd.append(float(np.mean(sd_vals)))
 
-        # 9. Reporte detallado de Ponderación Semántica en consola
+        # Reporte de ponderacion semantica en consola
         print(f"\n" + "=" * 62)
-        print(f"🧠 AGREGACIÓN SEMÁNTICA SemFedXAI — RONDA {server_round}".center(62))
+        print(f"AGREGACION SEMANTICA SemFedXAI — RONDA {server_round}".center(62))
         print("=" * 62)
         print(f"{'Cliente':<8} | {'Muestras':<8} | {'SR_i':<8} | {'DC_i':<8} | {'SD_i':<8} | {'Peso Sem':<10}")
         print("-" * 62)
@@ -237,9 +237,9 @@ class SemFedXAIStrategy(CustomStrategy):
         print("-" * 62)
         print(f"Promedios: SR={np.mean(sr_vals):.3f} | DC={np.mean(dc_vals):.3f} | SD={np.mean(sd_vals):.3f}")
 
-        # 10. Generación de Explicaciones Clínicas para Médicos/Psicólogos
+        # Generacion de explicaciones clinicas
         if has_vectors and self.kg_manager.last_round > 0:
-            print("\n📋 NARRATIVAS CLÍNICAS EXPLICABLES (Explanation Generator):")
+            print("\nNARRATIVAS CLINICAS EXPLICABLES (Explanation Generator):")
             for c_idx in range(min(2, len(self.class_names))):
                 narrative = self.expl_generator.global_class_narrative(self.kg_manager, c_idx, top_k=2)
                 print(narrative)

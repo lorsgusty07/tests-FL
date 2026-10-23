@@ -27,7 +27,7 @@ def make_collate_fn(pad_idx: int):
 
 
 class CNNTextClassifier(nn.Module):
-    """Arquitectura CNN para clasificación de texto extraída de la celda 10 del notebook."""
+    """Arquitectura CNN para clasificacion de texto."""
     def __init__(
         self,
         vocab_size: int,
@@ -77,12 +77,12 @@ class CPUMaskDropout(nn.Module):
 
 class CascadedCNN1DBlock(nn.Module):
     """
-    Paso 3: Módulo CNN-1D en Cascada para Extracción de Características locales.
-    A la salida de cada rama de Transformer, conecta un bloque convolucional 1D:
-      - 3 capas Conv1D con 64, 128 y 256 filtros y tamaños de kernel 3, 4 y 5 respectivamente (ReLU, padding='same').
-      - Capas de Max-Pooling 1D intercaladas para reducir la dimensión reteniendo los valores máximos.
-      - Capa de Average-Pooling 1D al final de cada rama para consolidar las características.
-      - Reduce la representación de 768 dimensiones a un vector denso mejorado de 384 dimensiones.
+    Modulo CNN-1D en cascada para extraccion de caracteristicas locales.
+    Conecta un bloque convolucional 1D a la salida de cada rama de Transformer:
+      - 3 capas Conv1D con 64, 128 y 256 filtros (kernels 3, 4 y 5; ReLU, padding='same').
+      - Capas de Max-Pooling 1D intercaladas para reducir la dimension.
+      - Capa de Average-Pooling 1D al final de cada rama para consolidar caracteristicas.
+      - Proyeccion a un vector denso de 384 dimensiones.
     """
     def __init__(self, in_channels: int = 768, out_dim: int = 384, dropout: float = 0.2):
         super().__init__()
@@ -252,13 +252,12 @@ def get_shared_transformers(
 
 class HybridTransformerClassifier(nn.Module):
     """
-    Modelo Híbrido Transformer + CNN-1D en Cascada para Clasificación en Ambiente Federado:
-      - Rama 1 (MentalBERT): 'mental/mental-bert-base-uncased' (768 dimensiones).
-      - Rama 2 (MelBERT): 'EhsanAghazadeh/melbert-roberta' (768 dimensiones).
-      - Paso 3: Módulos CNN-1D en cascada para cada rama -> O_MentalBERT (384) y O_MelBERT (384).
-      - Paso 4: Fusión O_fused = Concat(O_MentalBERT, O_MelBERT) en R^768.
-      - Paso 5: Capa densa oculta (128 neuronas) + Capa de salida Softmax de 4 clases
-               (Depresión, Ansiedad, BPD, PTSD).
+    Modelo Hibrido Transformer + CNN-1D en Cascada:
+      - Rama 1: MentalBERT ('mental/mental-bert-base-uncased', 768 dimensiones).
+      - Rama 2: MelBERT ('EhsanAghazadeh/melbert-roberta', 768 dimensiones).
+      - Modulos CNN-1D en cascada por rama (384 dimensiones cada uno).
+      - Fusion por concatenacion O_fused en R^768.
+      - Capa densa oculta (128 neuronas) y clasificador final.
     """
     def __init__(
         self,
@@ -303,17 +302,17 @@ class HybridTransformerClassifier(nn.Module):
             for p in self.melbert.parameters():
                 p.requires_grad = False
 
-        # Paso 3: Módulos CNN-1D en cascada para cada rama (768 -> 384)
+        # Modulos CNN-1D en cascada para cada rama (768 -> 384)
         self.cnn_mental = CascadedCNN1DBlock(in_channels=768, out_dim=384)
         self.cnn_mel = CascadedCNN1DBlock(in_channels=768, out_dim=384)
 
-        # Paso 5: Capa de clasificación densamente conectada
-        # Procesa vector fusionado de 768 dimensiones a través de capa oculta de 128 neuronas
+        # Capa de clasificacion densamente conectada
+        # Procesa vector fusionado de 768 dimensiones a traves de capa oculta de 128 neuronas
         self.fc_hidden = nn.Linear(768, 128)
         self.relu_hidden = nn.ReLU()
         self.dropout = CPUMaskDropout(0.3)
 
-        # Capa de salida: 4 clases (Depresión, Ansiedad, BPD, PTSD)
+        # Capa de salida
         self.classifier = nn.Linear(128, num_classes)
         self.softmax = nn.Softmax(dim=1)
 
@@ -386,13 +385,13 @@ class HybridTransformerClassifier(nn.Module):
         return mental_inputs, mel_inputs
 
     def classify_fused(self, o_fused: torch.Tensor) -> torch.Tensor:
-        """Paso 5: Capa de clasificación densamente conectada (768 -> 128 -> num_classes)."""
+        """Capa de clasificacion densamente conectada (768 -> 128 -> num_classes)."""
         h = self.dropout(self.relu_hidden(self.fc_hidden(o_fused)))
         return self.classifier(h)
 
     @staticmethod
     def mean_pooling(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Mean pooling ponderado por máscara (mismo método usado para criterios_embeddings.npy)."""
+        """Mean pooling ponderado por mascara."""
         mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
         summed = (last_hidden_state * mask).sum(dim=1)
         counts = mask.sum(dim=1).clamp(min=1e-9)
@@ -401,7 +400,7 @@ class HybridTransformerClassifier(nn.Module):
     def forward(self, x, return_features: bool = False):
         mental_inputs, mel_inputs = self._prepare_inputs(x)
 
-        # Paso 1 y 2: Generar embeddings contextuales de 768 dimensiones
+        # Generar embeddings contextuales de 768 dimensiones
         if self.freeze_transformers:
             with torch.no_grad():
                 emb_mental = self.mental_bert(**mental_inputs).last_hidden_state.detach()
@@ -410,19 +409,18 @@ class HybridTransformerClassifier(nn.Module):
             emb_mental = self.mental_bert(**mental_inputs).last_hidden_state
             emb_mel = self.melbert(**mel_inputs).last_hidden_state
 
-        # Paso 3: Módulos CNN-1D en cascada (768 -> 384 por rama)
+        # Modulos CNN-1D en cascada (768 -> 384 por rama)
         o_mental = self.cnn_mental(emb_mental)  # [B, 384]
         o_mel = self.cnn_mel(emb_mel)            # [B, 384]
 
-        # Paso 4: Fusión y concatenación: O_fused = Concat(O_MentalBERT, O_MelBERT) in R^768
+        # Fusion y concatenacion: O_fused = Concat(O_MentalBERT, O_MelBERT) en R^768
         o_fused = torch.cat([o_mental, o_mel], dim=1)  # [B, 768]
 
-        # Paso 5: Capa de clasificación densamente conectada (768 -> 128 -> num_classes)
+        # Capa de clasificacion (768 -> 128 -> num_classes)
         logits = self.classify_fused(o_fused)
 
         if return_features:
-            # Embedding de frase de MentalBERT (mean pooling), en el mismo espacio que
-            # criterios_embeddings.npy: lo usa el Local Knowledge Enhancer (SemFedXAI).
+            # Embedding de frase de MentalBERT (mean pooling)
             mental_sent = self.mean_pooling(emb_mental, mental_inputs["attention_mask"]).detach()
             return logits, o_fused, mental_sent
         return logits
