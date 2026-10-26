@@ -125,6 +125,7 @@ class FlowerClient(fl.client.NumPyClient):
 
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
             self.optimizer = optim.Adam(trainable_params, lr=self.lr)
+            self._diag_data_sanity()
         else:
             self.model = CNNTextClassifier(
                 vocab_size=self.vocab_size,
@@ -181,17 +182,33 @@ class FlowerClient(fl.client.NumPyClient):
         texts = [torch.tensor(seq.astype(np.int64)) for seq in data['texts']]
         labels = torch.tensor(data['labels'].astype(np.int64))
 
-        # División 80-20
-        split_idx = int(0.8 * len(texts))
+        # División 80-20 ESTRATIFICADA y barajada con semilla fija.
+        # Antes se cortaba por posición (texts[:80%]); si el .npz está agrupado por clase,
+        # entrenamiento y validación terminaban con clases distintas.
+        labels_np = labels.numpy()
+        rng = np.random.RandomState(42 + self.cid)
+        train_idx, val_idx = [], []
+        for c in np.unique(labels_np):
+            ci = rng.permutation(np.where(labels_np == c)[0])
+            k = len(ci) if len(ci) == 1 else int(round(0.8 * len(ci)))
+            train_idx.extend(ci[:k].tolist())
+            val_idx.extend(ci[k:].tolist())
+        train_idx = rng.permutation(train_idx).tolist()
+        val_idx = rng.permutation(val_idx).tolist() if val_idx else []
+
+        self.label_order_runs = int(np.sum(labels_np[1:] != labels_np[:-1])) if len(labels_np) > 1 else 0
+        self.train_label_counts = np.bincount(labels_np[train_idx], minlength=len(self.classes))
+        self.val_label_counts = np.bincount(labels_np[val_idx], minlength=len(self.classes)) if val_idx else np.zeros(len(self.classes), dtype=int)
+
         return (
             DataLoader(
-                TextDataset(texts[:split_idx], labels[:split_idx]),
+                TextDataset([texts[i] for i in train_idx], labels[train_idx]),
                 batch_size=self.batch_size,
                 shuffle=True,
                 collate_fn=self.collate_fn
             ),
             DataLoader(
-                TextDataset(texts[split_idx:], labels[split_idx:]),
+                TextDataset([texts[i] for i in val_idx], labels[val_idx]),
                 batch_size=self.batch_size,
                 shuffle=False,
                 collate_fn=self.collate_fn
@@ -319,19 +336,57 @@ class FlowerClient(fl.client.NumPyClient):
         self.model.eval()
 
         correct, total, loss = 0, 0, 0.0
+        pred_counts = torch.zeros(len(self.classes), dtype=torch.long)
         with torch.no_grad():
             for texts, labels in self.valloader:
                 texts, labels = texts.to(self.device), labels.to(self.device)
                 outputs = self.model(texts)
                 loss += self.criterion(outputs, labels).item() * labels.size(0)
                 total += labels.size(0)
-                correct += (outputs.argmax(1) == labels).sum().item()
+                preds = outputs.argmax(1)
+                correct += (preds == labels).sum().item()
+                pred_counts += torch.bincount(preds.cpu(), minlength=len(self.classes))
+
+        # Diagnóstico de colapso: si el modelo predice casi siempre una sola clase,
+        # su accuracy coincide con la proporción de la clase mayoritaria (baseline).
+        if total > 0:
+            top = int(pred_counts.argmax())
+            baseline = float(self.val_label_counts.max()) / max(int(self.val_label_counts.sum()), 1)
+            _diag(
+                f"cliente {self.cid}: eval acc={correct / total:.2%} | baseline_mayoritaria={baseline:.2%} | "
+                f"clase_predicha_dominante={self.classes[top]} ({pred_counts[top].item() / total:.0%} de las predicciones)"
+            )
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         accuracy = correct / total if total > 0 else 0.0
         return float(loss / total), total, {"accuracy": accuracy}
+
+    def _diag_data_sanity(self):
+        """Verifica que los IDs del .npz se decodifican a texto real antes de llegar a MentalBERT/MelBERT."""
+        try:
+            ds = self.trainloader.dataset
+            n_check = min(200, len(ds))
+            itos = getattr(self.model, "vocab_itos", None)
+            if not itos or n_check == 0:
+                _diag(f"cliente {self.cid}: [SANITY] sin vocab_itos: los IDs NO se decodifican a texto (entrada inválida para BERT)")
+                return
+            texts = self.model.ids_to_texts([ds.texts[i] for i in range(n_check)])
+            n_empty = sum(1 for t in texts if t == "empty")
+            all_ids = torch.cat([ds.texts[i] for i in range(n_check)])
+            oov = float((all_ids >= len(itos)).float().mean()) if all_ids.numel() else 0.0
+            names = [str(c) for c in self.classes]
+            tr = dict(zip(names, self.train_label_counts.tolist()))
+            va = dict(zip(names, self.val_label_counts.tolist()))
+            _diag(
+                f"cliente {self.cid}: [SANITY] textos vacíos={n_empty}/{n_check} | IDs fuera de vocab={oov:.1%} | "
+                f"cambios de etiqueta en el .npz={self.label_order_runs}"
+            )
+            _diag(f"cliente {self.cid}: [SANITY] train={tr} | val={va}")
+            _diag(f"cliente {self.cid}: [SANITY] ejemplo (label={names[int(ds.labels[0])]}): '{texts[0][:160]}'")
+        except Exception as e:
+            _diag(f"cliente {self.cid}: [SANITY] no se pudo verificar ({e})")
 
     def get_dense_stats(self):
         """Calcula el peso real de los parámetros comunicados en la red federada."""
