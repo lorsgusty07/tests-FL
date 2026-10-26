@@ -279,8 +279,8 @@ class FlowerClient(fl.client.NumPyClient):
         dc_val = float(sem_metrics.get("domain_consistency", 0.0))
         _diag(f"cliente {self.cid}: fit() fin (acc={accuracy:.2%}, SR={sr_val:.3f}, DC={dc_val:.3f})")
 
-        # Flower solo acepta en `metrics` valores escalares o listas planas de escalares
-        # (int | float | str | bytes | bool | list[...]); los dicts anidados se envían como JSON string.
+        # Flower solo acepta en `metrics` valores escalares (int | float | str | bytes | bool).
+        # Todo array/lista se serializa como JSON string para que Flower/Ray no rechace los resultados de fit.
         fit_metrics = {
             "accuracy": float(accuracy),
             "failed": False,
@@ -289,7 +289,7 @@ class FlowerClient(fl.client.NumPyClient):
         }
         exp_vec = sem_metrics.get("explanation_vector")
         if exp_vec is not None and len(exp_vec) > 0:
-            fit_metrics["explanation_vector"] = [float(v) for v in exp_vec]
+            fit_metrics["explanation_vector_json"] = json.dumps([float(v) for v in exp_vec])
 
         class_exp = sem_metrics.get("class_explanations")
         if class_exp is not None:
@@ -297,7 +297,7 @@ class FlowerClient(fl.client.NumPyClient):
 
         class_cnt = sem_metrics.get("class_counts")
         if class_cnt is not None:
-            fit_metrics["class_counts"] = [int(c) for c in class_cnt]
+            fit_metrics["class_counts_json"] = json.dumps([int(c) for c in class_cnt])
 
         return self.get_parameters({}), len(self.trainloader.dataset), fit_metrics
 

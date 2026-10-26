@@ -142,7 +142,17 @@ class SemFedXAIStrategy(CustomStrategy):
         accuracies = [r[1].metrics.get("accuracy", 0.0) for r in valid_results]
         sr_vals = np.array([float(r[1].metrics.get("semantic_relevance", 0.0)) for r in valid_results], dtype=np.float32)
         dc_vals = np.array([float(r[1].metrics.get("domain_consistency", 0.0)) for r in valid_results], dtype=np.float32)
-        exp_vectors = [r[1].metrics.get("explanation_vector", []) for r in valid_results]
+        exp_vectors = []
+        for r in valid_results:
+            vec = r[1].metrics.get("explanation_vector")
+            if vec is None:
+                raw_v = r[1].metrics.get("explanation_vector_json")
+                if raw_v:
+                    try:
+                        vec = json.loads(raw_v)
+                    except Exception:
+                        vec = []
+            exp_vectors.append(vec or [])
 
         # Calculo de Diversidad Semantica (SD_i)
         K = len(valid_results)
@@ -195,7 +205,16 @@ class SemFedXAIStrategy(CustomStrategy):
                     client_class_exps.append([])
             else:
                 client_class_exps.append([])
-            client_class_counts.append(r[1].metrics.get("class_counts", []))
+
+            cnt = r[1].metrics.get("class_counts")
+            if cnt is None:
+                raw_cnt = r[1].metrics.get("class_counts_json")
+                if raw_cnt:
+                    try:
+                        cnt = json.loads(raw_cnt)
+                    except Exception:
+                        cnt = []
+            client_class_counts.append(cnt or [])
 
         if has_vectors and any(len(e) > 0 for e in client_class_exps):
             self.kg_manager.update_graph(

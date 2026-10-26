@@ -207,7 +207,17 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
             n_samples = np.array([res[1] for res in fit_results], dtype=np.float32)
             sr_vals = np.array([float(res[2].get("semantic_relevance", 0.0)) for res in fit_results], dtype=np.float32)
             dc_vals = np.array([float(res[2].get("domain_consistency", 0.0)) for res in fit_results], dtype=np.float32)
-            exp_vectors = [res[2].get("explanation_vector", []) for res in fit_results]
+            exp_vectors = []
+            for res in fit_results:
+                vec = res[2].get("explanation_vector")
+                if vec is None:
+                    raw_v = res[2].get("explanation_vector_json")
+                    if raw_v:
+                        try:
+                            vec = json.loads(raw_v)
+                        except Exception:
+                            vec = []
+                exp_vectors.append(vec or [])
 
             K = len(fit_results)
             sd_vals = np.ones(K, dtype=np.float32)
@@ -246,7 +256,16 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
                         client_class_exps.append([])
                 else:
                     client_class_exps.append([])
-                client_class_counts.append(res[2].get("class_counts", []))
+
+                cnt = res[2].get("class_counts")
+                if cnt is None:
+                    raw_cnt = res[2].get("class_counts_json")
+                    if raw_cnt:
+                        try:
+                            cnt = json.loads(raw_cnt)
+                        except Exception:
+                            cnt = []
+                client_class_counts.append(cnt or [])
 
             if has_vectors and any(len(e) > 0 for e in client_class_exps):
                 strategy.kg_manager.update_graph(
