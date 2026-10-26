@@ -430,7 +430,7 @@ class LocalExplainer:
         self.class_names = list(class_names)
         self.top_k = top_k
 
-    def explain(self, z, logits, text_emb, head_fn, n_instances: int = 0) -> dict:
+    def explain(self, z, logits, text_emb, head_fn, labels: "torch.Tensor" = None, n_instances: int = 0) -> dict:
         enh = self.enh
         C_mat = enh.C
         n, n_classes, n_crit = z.shape[0], len(self.class_names), C_mat.shape[0]
@@ -463,6 +463,18 @@ class LocalExplainer:
             dc_per = 1.0 - rank / (proto_idx.numel() - 1)
             dc = float(dc_per[valid_pred].mean())
 
+        # Explanation Quality / Precision in Important Features (Amato & Branco, 2025):
+        # Mide la exactitud del explicador al seleccionar los criterios diagnósticos
+        # que verdaderamente corresponden al ground truth ontológico del DSM-5.
+        top_k = min(self.top_k, n_crit)
+        _, topk_crit = attr.topk(top_k, dim=-1)         # [n, top_k]
+        target_labels = labels if labels is not None else preds
+        gt_membership = enh.membership[target_labels]   # [n, n_crit]
+        in_gt = gt_membership.gather(1, topk_crit)      # [n, top_k]
+        eq_per_sample = in_gt.float().mean(dim=-1)       # [n] (0.0 a 1.0)
+        valid_samples = enh.has_proto[target_labels]
+        eq = float(eq_per_sample[valid_samples].mean()) if valid_samples.any() else 0.0
+
         # Explicaciones por clase predicha
         class_expl = torch.zeros(n_classes, n_crit, device=z.device)
         class_counts = torch.zeros(n_classes, device=z.device)
@@ -484,6 +496,7 @@ class LocalExplainer:
         return {
             "semantic_relevance": sr,
             "domain_consistency": dc,
+            "explanation_quality": eq,
             "explanation_vector": global_expl.cpu().numpy(),
             "class_explanations": class_expl.cpu().numpy(),
             "class_counts": class_counts.cpu().numpy().astype(int),

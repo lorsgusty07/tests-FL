@@ -25,6 +25,10 @@ class CustomStrategy(fl.server.strategy.FedAvg):
         self.best_accuracy = 0.0
         self.best_model = None
         self.history_accuracy = []
+        self.history_eq = []
+        self.latest_eq = 0.0
+        self.latest_fit_accuracy = 0.0
+        self.latest_num_clients = 0
         self.history_network_mb = []
         # Peso real (MB) de los parámetros que envía un cliente, medido en aggregate_fit
         self.payload_mb_per_client = 0.0
@@ -34,6 +38,7 @@ class CustomStrategy(fl.server.strategy.FedAvg):
         # Filtrar clientes fallidos
         valid_results = [r for r in results if not r[1].metrics.get("failed", False)]
         accuracies = [res.metrics["accuracy"] for _, res in valid_results if "accuracy" in res.metrics]
+        eq_vals = [float(res.metrics["explanation_quality"]) for _, res in valid_results if "explanation_quality" in res.metrics]
 
         # Medir el payload real que viaja por la red (bytes de los tensores serializados)
         if valid_results:
@@ -41,6 +46,15 @@ class CustomStrategy(fl.server.strategy.FedAvg):
             payload_bytes = sum(len(t) for t in first_params.tensors)
             self.payload_mb_per_client = payload_bytes / (1024 ** 2)
             self.payload_params_per_client = payload_bytes // 4  # float32
+            self.latest_num_clients = len(valid_results)
+
+        if eq_vals:
+            self.latest_eq = float(np.mean(eq_vals))
+            self.history_eq.append(self.latest_eq)
+        elif self.history_eq:
+            self.history_eq.append(self.history_eq[-1])
+        else:
+            self.history_eq.append(0.0)
 
         if accuracies:
             self.latest_fit_accuracy = float(np.mean(accuracies))
@@ -82,12 +96,17 @@ class CustomStrategy(fl.server.strategy.FedAvg):
         # Registro en consola
         print(f"--- Ronda {server_round} ---")
         print(f"Accuracy: {avg_accuracy:.2%}")
+        if self.latest_eq > 0.0:
+            print(f"Calidad Explicación (EQ): {self.latest_eq:.4f}")
         if total_mb_round > 0:
             print(f"Trafico de Red: {total_mb_round:.2f} MB")
         print("-" * 20)
 
         loss_aggregated, _ = super().aggregate_evaluate(server_round, results, failures)
-        return loss_aggregated, {"accuracy": avg_accuracy, "network_mb": total_mb_round}
+        eval_metrics = {"accuracy": avg_accuracy, "network_mb": total_mb_round}
+        if self.latest_eq > 0.0:
+            eval_metrics["explanation_quality"] = self.latest_eq
+        return loss_aggregated, eval_metrics
 
 
 class SemFedXAIStrategy(CustomStrategy):
@@ -142,6 +161,7 @@ class SemFedXAIStrategy(CustomStrategy):
         accuracies = [r[1].metrics.get("accuracy", 0.0) for r in valid_results]
         sr_vals = np.array([float(r[1].metrics.get("semantic_relevance", 0.0)) for r in valid_results], dtype=np.float32)
         dc_vals = np.array([float(r[1].metrics.get("domain_consistency", 0.0)) for r in valid_results], dtype=np.float32)
+        eq_vals = np.array([float(r[1].metrics.get("explanation_quality", 0.0)) for r in valid_results], dtype=np.float32)
         exp_vectors = []
         for r in valid_results:
             vec = r[1].metrics.get("explanation_vector")
@@ -231,6 +251,8 @@ class SemFedXAIStrategy(CustomStrategy):
 
         # Seguimiento del mejor modelo
         self.latest_num_clients = len(valid_results)
+        self.latest_eq = float(np.mean(eq_vals)) if len(eq_vals) > 0 else 0.0
+        self.history_eq.append(self.latest_eq)
         if accuracies:
             self.latest_fit_accuracy = float(np.mean(accuracies))
             best_idx = np.argmax(accuracies)
@@ -246,15 +268,15 @@ class SemFedXAIStrategy(CustomStrategy):
         self.history_sd.append(float(np.mean(sd_vals)))
 
         # Reporte de ponderacion semantica en consola
-        print(f"\n" + "=" * 62)
-        print(f"AGREGACION SEMANTICA SemFedXAI — RONDA {server_round}".center(62))
-        print("=" * 62)
-        print(f"{'Cliente':<8} | {'Muestras':<8} | {'SR_i':<8} | {'DC_i':<8} | {'SD_i':<8} | {'Peso Sem':<10}")
-        print("-" * 62)
+        print(f"\n" + "=" * 70)
+        print(f"AGREGACION SEMANTICA SemFedXAI — RONDA {server_round}".center(70))
+        print("=" * 70)
+        print(f"{'Cliente':<8} | {'Muestras':<8} | {'SR_i':<7} | {'DC_i':<7} | {'EQ_i':<7} | {'SD_i':<7} | {'Peso Sem':<10}")
+        print("-" * 70)
         for i in range(K):
-            print(f"C_{i:<6} | {int(n_samples[i]):<8} | {sr_vals[i]:<8.3f} | {dc_vals[i]:<8.3f} | {sd_vals[i]:<8.3f} | {normalized_weights[i]:<9.2%}")
-        print("-" * 62)
-        print(f"Promedios: SR={np.mean(sr_vals):.3f} | DC={np.mean(dc_vals):.3f} | SD={np.mean(sd_vals):.3f}")
+            print(f"C_{i:<6} | {int(n_samples[i]):<8} | {sr_vals[i]:<7.3f} | {dc_vals[i]:<7.3f} | {eq_vals[i]:<7.3f} | {sd_vals[i]:<7.3f} | {normalized_weights[i]:<9.2%}")
+        print("-" * 70)
+        print(f"Promedios: SR={np.mean(sr_vals):.3f} | DC={np.mean(dc_vals):.3f} | EQ={self.latest_eq:.3f} | SD={np.mean(sd_vals):.3f}")
 
         # Generacion de explicaciones clinicas
         if has_vectors and self.kg_manager.last_round > 0:
@@ -263,10 +285,11 @@ class SemFedXAIStrategy(CustomStrategy):
                 narrative = self.expl_generator.global_class_narrative(self.kg_manager, c_idx, top_k=2)
                 print(narrative)
                 print()
-        print("=" * 62 + "\n")
+        print("=" * 70 + "\n")
 
         return parameters_aggregated, {
             "avg_sr": float(np.mean(sr_vals)),
             "avg_dc": float(np.mean(dc_vals)),
             "avg_sd": float(np.mean(sd_vals)),
+            "avg_eq": self.latest_eq,
         }

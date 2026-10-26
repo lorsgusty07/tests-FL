@@ -68,7 +68,8 @@ class FlowerClient(fl.client.NumPyClient):
         batch_size: int = None,
         use_semfedxai: bool = True,
         knowledge_base: DSM5KnowledgeBase = None,
-        lambda_onto: float = 0.1
+        lambda_onto: float = 0.1,
+        local_epochs: int = 1
     ):
         self.cid = int(cid)
         self.vocab = vocab
@@ -78,6 +79,7 @@ class FlowerClient(fl.client.NumPyClient):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.pad_idx = vocab['<pad>'] if '<pad>' in vocab else 0
         self.use_semfedxai = use_semfedxai
+        self.local_epochs = int(local_epochs) if local_epochs and local_epochs > 0 else 1
 
         if batch_size is not None and batch_size > 0:
             self.batch_size = batch_size
@@ -138,16 +140,19 @@ class FlowerClient(fl.client.NumPyClient):
         self.enhancer = None
         self.onto_loss_fn = None
         self.explainer = None
-        if self.use_semfedxai:
-            try:
-                if self.kb is None:
-                    self.kb = DSM5KnowledgeBase(base_dir=self.data_dir)
+        try:
+            if self.kb is None and self.data_dir:
+                self.kb = DSM5KnowledgeBase(base_dir=self.data_dir)
+            if self.kb is not None:
                 self.enhancer = LocalKnowledgeEnhancer(self.kb, self.classes, self.device)
-                self.onto_loss_fn = OntologyAlignmentLoss(self.enhancer)
                 self.explainer = LocalExplainer(self.kb, self.enhancer, self.classes)
-                _diag(f"cliente {self.cid}: módulos SemFedXAI inicializados con éxito.")
-            except Exception as e:
-                _diag(f"cliente {self.cid}: SemFedXAI omitido/error al cargar ontología ({e})")
+                if self.use_semfedxai:
+                    self.onto_loss_fn = OntologyAlignmentLoss(self.enhancer)
+                    _diag(f"cliente {self.cid}: módulos SemFedXAI (LKE, L_onto, LE) activos.")
+                else:
+                    _diag(f"cliente {self.cid}: LocalExplainer activo para evaluación comparativa (FedAvg).")
+        except Exception as e:
+            _diag(f"cliente {self.cid}: módulos semánticos omitidos ({e})")
 
     def _resolve_client_data_path(self):
         """Busca el archivo client_{cid}.npz en la ruta configurada o rutas de fallback."""
@@ -209,14 +214,14 @@ class FlowerClient(fl.client.NumPyClient):
             return self.get_parameters({}), 0, {"accuracy": 0.0, "failed": True}
 
         self.set_parameters(parameters)
-        _diag(f"cliente {self.cid}: fit() inicio ({len(self.trainloader.dataset)} muestras, batch={self.batch_size})")
+        _diag(f"cliente {self.cid}: fit() inicio ({len(self.trainloader.dataset)} muestras, batch={self.batch_size}, epochs={self.local_epochs})")
 
         max_batches = config.get("max_batches") if config else None
         total_samples = 0
         correct = 0
         done = 0
         self.model.train()
-        for epoch in range(3):
+        for epoch in range(self.local_epochs):
             for step, (texts, labels) in enumerate(self.trainloader):
                 texts, labels = texts.to(self.device), labels.to(self.device)
                 self.optimizer.zero_grad()
@@ -245,13 +250,14 @@ class FlowerClient(fl.client.NumPyClient):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Generación de Explicaciones Semánticas Locales (SemFedXAI)
+        # Generación de Explicaciones Semánticas Locales (SemFedXAI y FedAvg)
         sem_metrics = {}
-        if self.use_semfedxai and self.explainer is not None and self.model_type == "hybrid":
+        if self.explainer is not None and self.model_type == "hybrid":
             self.model.eval()
             all_z = []
             all_logits = []
             all_sent = []
+            all_labels = []
             count = 0
             with torch.no_grad():
                 for texts, labels in self.valloader:
@@ -260,6 +266,7 @@ class FlowerClient(fl.client.NumPyClient):
                     all_z.append(z)
                     all_logits.append(out)
                     all_sent.append(sent)
+                    all_labels.append(labels)
                     count += len(labels)
                     if count >= 64:
                         break
@@ -267,17 +274,20 @@ class FlowerClient(fl.client.NumPyClient):
                 cat_z = torch.cat(all_z, dim=0)
                 cat_logits = torch.cat(all_logits, dim=0)
                 cat_sent = torch.cat(all_sent, dim=0)
+                cat_labels = torch.cat(all_labels, dim=0)
                 sem_metrics = self.explainer.explain(
                     cat_z,
                     cat_logits,
                     cat_sent,
-                    self.model.classify_fused
+                    self.model.classify_fused,
+                    labels=cat_labels
                 )
 
         accuracy = correct / total_samples if total_samples > 0 else 0.0
         sr_val = float(sem_metrics.get("semantic_relevance", 0.0))
         dc_val = float(sem_metrics.get("domain_consistency", 0.0))
-        _diag(f"cliente {self.cid}: fit() fin (acc={accuracy:.2%}, SR={sr_val:.3f}, DC={dc_val:.3f})")
+        eq_val = float(sem_metrics.get("explanation_quality", 0.0))
+        _diag(f"cliente {self.cid}: fit() fin (acc={accuracy:.2%}, EQ={eq_val:.3f}, SR={sr_val:.3f}, DC={dc_val:.3f})")
 
         # Flower solo acepta en `metrics` valores escalares (int | float | str | bytes | bool).
         # Todo array/lista se serializa como JSON string para que Flower/Ray no rechace los resultados de fit.
@@ -286,6 +296,7 @@ class FlowerClient(fl.client.NumPyClient):
             "failed": False,
             "semantic_relevance": sr_val,
             "domain_consistency": dc_val,
+            "explanation_quality": eq_val,
         }
         exp_vec = sem_metrics.get("explanation_vector")
         if exp_vec is not None and len(exp_vec) > 0:

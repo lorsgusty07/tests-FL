@@ -203,10 +203,21 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
         if not fit_results:
             raise RuntimeError("Ningún cliente devolvió resultados válidos en esta ronda.")
 
+        # Metricas de Explanation Quality en fit_results
+        eq_vals_all = [float(res[2].get("explanation_quality", 0.0)) for res in fit_results if "explanation_quality" in res[2]]
+        if eq_vals_all:
+            strategy.latest_eq = float(np.mean(eq_vals_all))
+            strategy.history_eq.append(strategy.latest_eq)
+        elif getattr(strategy, "history_eq", None):
+            strategy.history_eq.append(strategy.history_eq[-1])
+        else:
+            strategy.history_eq = [0.0]
+
         if isinstance(strategy, SemFedXAIStrategy):
             n_samples = np.array([res[1] for res in fit_results], dtype=np.float32)
             sr_vals = np.array([float(res[2].get("semantic_relevance", 0.0)) for res in fit_results], dtype=np.float32)
             dc_vals = np.array([float(res[2].get("domain_consistency", 0.0)) for res in fit_results], dtype=np.float32)
+            eq_vals = np.array([float(res[2].get("explanation_quality", 0.0)) for res in fit_results], dtype=np.float32)
             exp_vectors = []
             for res in fit_results:
                 vec = res[2].get("explanation_vector")
@@ -280,15 +291,15 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
                 except Exception as e:
                     print(f"[WARN] Error al exportar grafo Turtle: {e}")
 
-            print(f"\n" + "=" * 62)
-            print(f"AGREGACIÓN SEMÁNTICA SemFedXAI — RONDA {rnd}".center(62))
-            print("=" * 62)
-            print(f"{'Cliente':<8} | {'Muestras':<8} | {'SR_i':<8} | {'DC_i':<8} | {'SD_i':<8} | {'Peso Sem':<10}")
-            print("-" * 62)
+            print(f"\n" + "=" * 70)
+            print(f"AGREGACIÓN SEMÁNTICA SemFedXAI — RONDA {rnd}".center(70))
+            print("=" * 70)
+            print(f"{'Cliente':<8} | {'Muestras':<8} | {'SR_i':<7} | {'DC_i':<7} | {'EQ_i':<7} | {'SD_i':<7} | {'Peso Sem':<10}")
+            print("-" * 70)
             for i in range(K):
-                print(f"C_{i:<6} | {int(n_samples[i]):<8} | {sr_vals[i]:<8.3f} | {dc_vals[i]:<8.3f} | {sd_vals[i]:<8.3f} | {sem_weights[i]:<9.2%}")
-            print("-" * 62)
-            print(f"Promedios: SR={np.mean(sr_vals):.3f} | DC={np.mean(dc_vals):.3f} | SD={np.mean(sd_vals):.3f}")
+                print(f"C_{i:<6} | {int(n_samples[i]):<8} | {sr_vals[i]:<7.3f} | {dc_vals[i]:<7.3f} | {eq_vals[i]:<7.3f} | {sd_vals[i]:<7.3f} | {sem_weights[i]:<9.2%}")
+            print("-" * 70)
+            print(f"Promedios: SR={np.mean(sr_vals):.3f} | DC={np.mean(dc_vals):.3f} | EQ={strategy.latest_eq:.3f} | SD={np.mean(sd_vals):.3f}")
 
             if has_vectors and strategy.kg_manager.last_round > 0:
                 print("\nNARRATIVAS CLÍNICAS EXPLICABLES (Explanation Generator):")
@@ -296,7 +307,7 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
                     narrative = strategy.expl_generator.global_class_narrative(strategy.kg_manager, c_idx, top_k=2)
                     print(narrative)
                     print()
-            print("=" * 62 + "\n")
+            print("=" * 70 + "\n")
         else:
             global_params = aggregate([(res[0], res[1]) for res in fit_results])
 
@@ -325,6 +336,8 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
 
         print(f"--- Ronda {rnd} ---")
         print(f"Accuracy: {avg_acc:.2%}  (loss media: {float(np.mean(eval_losses)):.4f})")
+        if strategy.latest_eq > 0.0:
+            print(f"Calidad Explicación (EQ): {strategy.latest_eq:.4f}")
         print(f"Tráfico Red: {total_mb_round:.2f} MB")
         print("-" * 20, flush=True)
 
@@ -343,7 +356,8 @@ def main(
     alpha: float = None,
     beta: float = None,
     gamma: float = None,
-    lambda_onto: float = None
+    lambda_onto: float = None,
+    local_epochs: int = None
 ):
     default_data_dir = (
         "/content/drive/My Drive/federated_text_data"
@@ -354,6 +368,7 @@ def main(
     parser.add_argument("--data-dir", type=str, default=default_data_dir, help="Directorio con datos federados")
     parser.add_argument("--num-clients", type=int, default=5, help="Número de clientes federados")
     parser.add_argument("--num-rounds", type=int, default=10, help="Número de rondas de comunicación")
+    parser.add_argument("--local-epochs", type=int, default=1, help="Número de épocas locales por cliente (1 recomendado para mitigar Client Drift)")
     parser.add_argument("--strategy", type=str, choices=["semfedxai", "fedavg"], default="semfedxai", help="Estrategia federada ('semfedxai' o 'fedavg')")
     parser.add_argument("--alpha", type=float, default=0.5, help="SemFedXAI: Ponderación de Relevancia Semántica (SR)")
     parser.add_argument("--beta", type=float, default=0.5, help="SemFedXAI: Ponderación de Consistencia Ontológica (DC)")
@@ -380,6 +395,8 @@ def main(
         args.num_clients = num_clients
     if num_rounds is not None:
         args.num_rounds = num_rounds
+    if local_epochs is not None:
+        args.local_epochs = local_epochs
     if simulate_failures:
         args.simulate_failures = True
     if output_csv is not None:
@@ -401,6 +418,7 @@ def main(
 
     print("==================================================")
     print(" INICIANDO APRENDIZAJE FEDERADO ")
+    print(f" ÉPOCAS LOCALES POR CLIENTE: {args.local_epochs}")
     if args.strategy == "semfedxai":
         print(f" ESTRATEGIA: SemFedXAI (α={args.alpha}, β={args.beta}, γ={args.gamma}, λ_onto={args.lambda_onto})")
     else:
@@ -492,15 +510,17 @@ def main(
         snapshot_download(mel_name, token=hf_token)
         print("[INFO] Archivos de MentalBERT y MelBERT disponibles en la caché local.")
 
-    # Cargar base de conocimiento ontológica para SemFedXAI
+    # Cargar base de conocimiento ontológica DSM-5 (para SemFedXAI y evaluación de Calidad de Explicación EQ)
     kb = None
-    if args.strategy == "semfedxai":
-        try:
-            kb = DSM5KnowledgeBase(base_dir=args.data_dir)
-            print(f"[INFO] Base de Conocimiento DSM-5 cargada: {len(kb.criteria)} criterios clínicos.")
-        except Exception as e:
+    try:
+        kb = DSM5KnowledgeBase(base_dir=args.data_dir)
+        print(f"[INFO] Base de Conocimiento DSM-5 cargada: {len(kb.criteria)} criterios clínicos.")
+    except Exception as e:
+        if args.strategy == "semfedxai":
             print(f"[WARN] No se pudo cargar la base ontológica DSM-5 ({e}). Se usará FedAvg estándar.")
             args.strategy = "fedavg"
+        else:
+            print(f"[INFO] Base ontológica DSM-5 no disponible ({e}). Métrica EQ deshabilitada.")
 
     # Generador de clientes
     def client_fn(cid: str):
@@ -519,7 +539,8 @@ def main(
             batch_size=args.batch_size,
             use_semfedxai=(args.strategy == "semfedxai"),
             knowledge_base=kb,
-            lambda_onto=args.lambda_onto
+            lambda_onto=args.lambda_onto,
+            local_epochs=args.local_epochs
         )
         return client.to_client() if hasattr(client, "to_client") else client
 
@@ -558,7 +579,8 @@ def main(
             batch_size=args.batch_size,
             use_semfedxai=(args.strategy == "semfedxai"),
             knowledge_base=kb,
-            lambda_onto=args.lambda_onto
+            lambda_onto=args.lambda_onto,
+            local_epochs=args.local_epochs
         )
 
     # Modo hijo del preflight: ejecuta 1 cliente real (2 batches) y termina
@@ -665,26 +687,56 @@ def main(
 
     # Visualización de Resultados
     if strategy.history_accuracy:
-        plt.figure(figsize=(10, 5))
-        plt.plot(range(1, len(strategy.history_accuracy) + 1), strategy.history_accuracy, 'b-o', label='Precisión Promedio')
-        plt.xlabel("Ronda de Comunicación")
-        plt.ylabel("Precisión")
-        plt.title("Evolución del Rendimiento")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(args.output_plot)
-        print(f"\n[INFO] Gráfica de evolución guardada en: {args.output_plot}")
+        has_eq = bool(getattr(strategy, "history_eq", None) and any(v > 0.0 for v in strategy.history_eq))
+        rounds = list(range(1, len(strategy.history_accuracy) + 1))
+        
+        if has_eq:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+            # Subplot 1: Precisión Global
+            ax1.plot(rounds, strategy.history_accuracy, 'b-o', label='Precisión Global')
+            ax1.set_xlabel("Ronda de Comunicación")
+            ax1.set_ylabel("Precisión")
+            ax1.set_title("Evolución de la Precisión")
+            ax1.grid(True)
+            ax1.legend()
+
+            # Subplot 2: Calidad de Explicación (EQ)
+            eq_series = strategy.history_eq[:len(rounds)]
+            ax2.plot(rounds, eq_series, 'g-s', label='Explanation Quality (EQ)')
+            ax2.set_xlabel("Ronda de Comunicación")
+            ax2.set_ylabel("Calidad de Explicación (0.0 - 1.0)")
+            ax2.set_title("Calidad de Explicaciones (Precision in Important Features)")
+            ax2.set_ylim([-0.05, 1.05])
+            ax2.grid(True)
+            ax2.legend()
+
+            plt.tight_layout()
+            plt.savefig(args.output_plot)
+            print(f"\n[INFO] Gráfica de evolución guardada en: {args.output_plot}")
+        else:
+            plt.figure(figsize=(10, 5))
+            plt.plot(rounds, strategy.history_accuracy, 'b-o', label='Precisión Promedio')
+            plt.xlabel("Ronda de Comunicación")
+            plt.ylabel("Precisión")
+            plt.title("Evolución del Rendimiento")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(args.output_plot)
+            print(f"\n[INFO] Gráfica de evolución guardada en: {args.output_plot}")
 
     # Exportación de métricas a CSV
     if strategy.history_accuracy:
-        df_precision = pd.DataFrame({
+        data_dict = {
             "Ronda de Comunicación": list(range(1, len(strategy.history_accuracy) + 1)),
             "Precisión": strategy.history_accuracy
-        })
+        }
+        if getattr(strategy, "history_eq", None) and any(v > 0.0 for v in strategy.history_eq):
+            data_dict["Calidad de Explicación (EQ)"] = strategy.history_eq[:len(strategy.history_accuracy)]
+        df_precision = pd.DataFrame(data_dict)
         df_precision.to_csv(args.output_csv, index=False)
-        print(f"[INFO] Tabla de precisión exportada a: {args.output_csv}")
-        print("\nResumen de precisión por ronda:")
+        print(f"[INFO] Tabla de métricas exportada a: {args.output_csv}")
+        print("\nResumen de métricas por ronda:")
         print(df_precision.to_string(index=False))
 
 
