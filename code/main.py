@@ -357,7 +357,8 @@ def main(
     beta: float = None,
     gamma: float = None,
     lambda_onto: float = None,
-    local_epochs: int = None
+    local_epochs: int = None,
+    lr: float = None
 ):
     default_data_dir = (
         "/content/drive/My Drive/federated_text_data"
@@ -369,6 +370,7 @@ def main(
     parser.add_argument("--num-clients", type=int, default=5, help="Número de clientes federados")
     parser.add_argument("--num-rounds", type=int, default=10, help="Número de rondas de comunicación")
     parser.add_argument("--local-epochs", type=int, default=1, help="Número de épocas locales por cliente (1 recomendado para mitigar Client Drift)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Tasa de aprendizaje (learning rate, por defecto 1e-4)")
     parser.add_argument("--strategy", type=str, choices=["semfedxai", "fedavg"], default="semfedxai", help="Estrategia federada ('semfedxai' o 'fedavg')")
     parser.add_argument("--alpha", type=float, default=0.5, help="SemFedXAI: Ponderación de Relevancia Semántica (SR)")
     parser.add_argument("--beta", type=float, default=0.5, help="SemFedXAI: Ponderación de Consistencia Ontológica (DC)")
@@ -397,6 +399,8 @@ def main(
         args.num_rounds = num_rounds
     if local_epochs is not None:
         args.local_epochs = local_epochs
+    if lr is not None:
+        args.lr = lr
     if simulate_failures:
         args.simulate_failures = True
     if output_csv is not None:
@@ -540,7 +544,8 @@ def main(
             use_semfedxai=(args.strategy == "semfedxai"),
             knowledge_base=kb,
             lambda_onto=args.lambda_onto,
-            local_epochs=args.local_epochs
+            local_epochs=args.local_epochs,
+            lr=args.lr
         )
         return client.to_client() if hasattr(client, "to_client") else client
 
@@ -580,7 +585,8 @@ def main(
             use_semfedxai=(args.strategy == "semfedxai"),
             knowledge_base=kb,
             lambda_onto=args.lambda_onto,
-            local_epochs=args.local_epochs
+            local_epochs=args.local_epochs,
+            lr=args.lr
         )
 
     # Modo hijo del preflight: ejecuta 1 cliente real (2 batches) y termina

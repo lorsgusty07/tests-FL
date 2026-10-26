@@ -69,7 +69,8 @@ class FlowerClient(fl.client.NumPyClient):
         use_semfedxai: bool = True,
         knowledge_base: DSM5KnowledgeBase = None,
         lambda_onto: float = 0.1,
-        local_epochs: int = 1
+        local_epochs: int = 1,
+        lr: float = 1e-4
     ):
         self.cid = int(cid)
         self.vocab = vocab
@@ -80,6 +81,7 @@ class FlowerClient(fl.client.NumPyClient):
         self.pad_idx = vocab['<pad>'] if '<pad>' in vocab else 0
         self.use_semfedxai = use_semfedxai
         self.local_epochs = int(local_epochs) if local_epochs and local_epochs > 0 else 1
+        self.lr = float(lr) if lr and lr > 0 else 1e-4
 
         if batch_size is not None and batch_size > 0:
             self.batch_size = batch_size
@@ -122,14 +124,14 @@ class FlowerClient(fl.client.NumPyClient):
             _diag(f"cliente {self.cid}: modelo en {self.device}")
 
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-            self.optimizer = optim.Adam(trainable_params, lr=1e-4)
+            self.optimizer = optim.Adam(trainable_params, lr=self.lr)
         else:
             self.model = CNNTextClassifier(
                 vocab_size=self.vocab_size,
                 num_classes=len(self.classes),
                 pad_idx=self.pad_idx
             ).to(self.device)
-            self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
+            self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
 
         self.criterion = nn.CrossEntropyLoss()
         self.simulate_failures = simulate_failures

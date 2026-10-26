@@ -437,19 +437,19 @@ class LocalExplainer:
         preds = logits.argmax(dim=1)
         probs = torch.softmax(logits, dim=1)
 
-        # Atribución conceptual (gradiente sólo a través de la cabeza densa)
-        with torch.enable_grad():
-            zg = z.detach().clone().requires_grad_(True)
-            out = head_fn(zg)
-            grad, = torch.autograd.grad(out.gather(1, preds.unsqueeze(1)).sum(), zg)
-        zn = F.normalize(z.detach(), dim=-1)
-        concept = zn @ C_mat.T
-        sens = grad @ C_mat.T
-        attr = F.relu(concept) * F.relu(sens)
+        # Activación de conceptos en el texto (similitud semántica texto <-> 689 criterios DSM-5)
+        act = enh.concept_activations(text_emb)  # [n, n_crit]
+
+        # Relevancia ontológica de cada criterio para la clase predicha por el modelo
+        crit_class_rel = enh.membership + 0.2 * F.relu(enh.prototypes @ C_mat.T)  # [n_classes, n_crit]
+        pred_rel = crit_class_rel[preds]  # [n, n_crit]
+
+        # Atribución de características del explicador (conceptos activos en el texto ponderados por la predicción)
+        attr = F.relu(act) * pred_rel
         attr = attr / attr.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
         # SR_i (dependiente del modelo)
-        act = enh.concept_activations(text_emb)
+        zn = F.normalize(z.detach(), dim=-1)
         tgt, valid_pred = enh.semantic_targets(act, preds)
         sr = float((zn * tgt).sum(-1).clamp(0, 1)[valid_pred].mean()) if valid_pred.any() else 0.0
 
