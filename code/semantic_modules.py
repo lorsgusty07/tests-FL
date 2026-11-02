@@ -464,16 +464,35 @@ class LocalExplainer:
             dc = float(dc_per[valid_pred].mean())
 
         # Explanation Quality / Precision in Important Features (Amato & Branco, 2025):
-        # Mide la exactitud del explicador al seleccionar los criterios diagnósticos
-        # que verdaderamente corresponden al ground truth ontológico del DSM-5.
+        # precisión de los top-k criterios DSM-5 seleccionados frente al ground truth ontológico
+        # de la clase REAL de la muestra. Solo cuentan muestras de clases con criterios (no 'Normal').
         top_k = min(self.top_k, n_crit)
-        _, topk_crit = attr.topk(top_k, dim=-1)         # [n, top_k]
         target_labels = labels if labels is not None else preds
         gt_membership = enh.membership[target_labels]   # [n, n_crit]
-        in_gt = gt_membership.gather(1, topk_crit)      # [n, top_k]
-        eq_per_sample = in_gt.float().mean(dim=-1)       # [n] (0.0 a 1.0)
         valid_samples = enh.has_proto[target_labels]
-        eq = float(eq_per_sample[valid_samples].mean()) if valid_samples.any() else 0.0
+
+        def _precision_topk(scores: "torch.Tensor") -> "torch.Tensor":
+            _, idx = scores.topk(top_k, dim=-1)
+            return gt_membership.gather(1, idx).float().mean(dim=-1)   # [n] en [0, 1]
+
+        def _mean_valid(per_sample: "torch.Tensor") -> float:
+            return float(per_sample[valid_samples].mean()) if valid_samples.any() else 0.0
+
+        # (a) EQ PRINCIPAL, independiente de la clase predicha: qué criterios DSM-5 codifica la
+        #     representación interna aprendida z (O_fused). No usa ni la etiqueta ni la predicción
+        #     para elegir criterios, así que no se reduce a la accuracy. Se centra z con la media del
+        #     lote (igual que los criterios están centrados) para quitar el sesgo común de la
+        #     activación ReLU y quedarse con lo que distingue a cada muestra.
+        zd = z.detach()
+        zc = F.normalize(zd - zd.mean(dim=0, keepdim=True), dim=-1) if n > 1 else F.normalize(zd, dim=-1)
+        eq = _mean_valid(_precision_topk(zc @ C_mat.T))
+
+        # (b) Referencia: EQ esperada por puro azar (tamaño del conjunto GT / total de criterios).
+        eq_chance = _mean_valid(gt_membership.sum(dim=-1) / n_crit)
+
+        # (c) Control: EQ condicionada a la clase predicha (texto x ontología de la clase predicha).
+        #     Depende de la accuracy, por eso NO es la métrica principal; sirve para contrastar.
+        eq_pred = _mean_valid(_precision_topk(attr))
 
         # Explicaciones por clase predicha
         class_expl = torch.zeros(n_classes, n_crit, device=z.device)
@@ -497,6 +516,8 @@ class LocalExplainer:
             "semantic_relevance": sr,
             "domain_consistency": dc,
             "explanation_quality": eq,
+            "explanation_chance": eq_chance,
+            "explanation_quality_pred": eq_pred,
             "explanation_vector": global_expl.cpu().numpy(),
             "class_explanations": class_expl.cpu().numpy(),
             "class_counts": class_counts.cpu().numpy().astype(int),

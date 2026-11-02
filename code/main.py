@@ -22,7 +22,12 @@ import flwr as fl
 # Permitir importaciones locales si se corre directamente
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from client import FlowerClient
-from strategy import CustomStrategy, SemFedXAIStrategy
+from strategy import (
+    CustomStrategy,
+    SemFedXAIStrategy,
+    parse_explanation_vectors,
+    compute_semantic_diversity,
+)
 from semantic_modules import DSM5KnowledgeBase
 
 
@@ -203,47 +208,16 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
         if not fit_results:
             raise RuntimeError("Ningún cliente devolvió resultados válidos en esta ronda.")
 
-        # Metricas de Explanation Quality en fit_results
-        eq_vals_all = [float(res[2].get("explanation_quality", 0.0)) for res in fit_results if "explanation_quality" in res[2]]
-        if eq_vals_all:
-            strategy.latest_eq = float(np.mean(eq_vals_all))
-            strategy.history_eq.append(strategy.latest_eq)
-        elif getattr(strategy, "history_eq", None):
-            strategy.history_eq.append(strategy.history_eq[-1])
-        else:
-            strategy.history_eq = [0.0]
-
         if isinstance(strategy, SemFedXAIStrategy):
             n_samples = np.array([res[1] for res in fit_results], dtype=np.float32)
             sr_vals = np.array([float(res[2].get("semantic_relevance", 0.0)) for res in fit_results], dtype=np.float32)
             dc_vals = np.array([float(res[2].get("domain_consistency", 0.0)) for res in fit_results], dtype=np.float32)
             eq_vals = np.array([float(res[2].get("explanation_quality", 0.0)) for res in fit_results], dtype=np.float32)
-            exp_vectors = []
-            for res in fit_results:
-                vec = res[2].get("explanation_vector")
-                if vec is None:
-                    raw_v = res[2].get("explanation_vector_json")
-                    if raw_v:
-                        try:
-                            vec = json.loads(raw_v)
-                        except Exception:
-                            vec = []
-                exp_vectors.append(vec or [])
+            exp_vectors = parse_explanation_vectors([res[2] for res in fit_results])
 
             K = len(fit_results)
-            sd_vals = np.ones(K, dtype=np.float32)
-            has_vectors = K > 0 and all(len(v) > 0 for v in exp_vectors) and len({len(v) for v in exp_vectors}) == 1
-            exp_mat = np.array(exp_vectors, dtype=np.float32) if has_vectors else None
-            if has_vectors and K > 1:
-                for i in range(K):
-                    other_centroid = np.mean(np.delete(exp_mat, i, axis=0), axis=0)
-                    norm_i = np.linalg.norm(exp_mat[i])
-                    norm_c = np.linalg.norm(other_centroid)
-                    if norm_i > 1e-6 and norm_c > 1e-6:
-                        sim = float(np.dot(exp_mat[i], other_centroid) / (norm_i * norm_c))
-                        sd_vals[i] = float(np.clip(1.0 - sim, 0.0, 1.0))
-                    else:
-                        sd_vals[i] = 0.5
+            sd_vals, has_vectors = compute_semantic_diversity(exp_vectors)
+            strategy.record_round_metrics([res[2] for res in fit_results], sd_vals=sd_vals)
 
             raw_w = (
                 n_samples *
@@ -310,7 +284,9 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
             print("=" * 70 + "\n")
         else:
             global_params = aggregate([(res[0], res[1]) for res in fit_results])
+            strategy.record_round_metrics([res[2] for res in fit_results])
 
+        strategy.final_ndarrays = global_params
         strategy.payload_mb_per_client = payload_bytes / (1024 ** 2)
         strategy.payload_params_per_client = payload_bytes // 4
         best_acc = max(fit_accs)
@@ -318,12 +294,15 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
             strategy.best_accuracy = best_acc
             print(f"[INFO] Nuevo mejor modelo (Accuracy: {best_acc:.2%})", flush=True)
 
-        eval_accs, eval_losses = [], []
+        eval_accs, eval_losses, eval_confusions = [], [], []
         for cid in range(num_clients):
             client = build_client(cid)
             loss, _, metrics = client.evaluate(global_params, {})
             eval_accs.append(metrics["accuracy"])
             eval_losses.append(loss)
+            raw_cm = metrics.get("confusion_json")
+            if raw_cm:
+                eval_confusions.append(json.loads(raw_cm))
             del client
             gc.collect()
             if torch.cuda.is_available():
@@ -333,13 +312,10 @@ def run_sequential(build_client, strategy, num_clients: int, num_rounds: int):
         total_mb_round = len(fit_results) * strategy.payload_mb_per_client * 2
         strategy.history_accuracy.append(avg_acc)
         strategy.history_network_mb.append(total_mb_round)
+        strategy.record_eval_metrics(avg_acc, eval_confusions)
 
-        print(f"--- Ronda {rnd} ---")
-        print(f"Accuracy: {avg_acc:.2%}  (loss media: {float(np.mean(eval_losses)):.4f})")
-        if strategy.latest_eq > 0.0:
-            print(f"Calidad Explicación (EQ): {strategy.latest_eq:.4f}")
-        print(f"Tráfico Red: {total_mb_round:.2f} MB")
-        print("-" * 20, flush=True)
+        strategy.print_round_summary(rnd, avg_acc, total_mb_round, loss=float(np.mean(eval_losses)))
+        sys.stdout.flush()
 
     return global_params
 
@@ -659,8 +635,11 @@ def main(
                 ray.shutdown()
             except Exception:
                 pass
-            strategy.history_accuracy.clear()
-            strategy.history_network_mb.clear()
+            for hist_name in (
+                "history_accuracy", "history_network_mb", "history_macro_f1", "history_eq",
+                "history_eq_chance", "history_eq_pred", "history_sr", "history_dc", "history_sd",
+            ):
+                getattr(strategy, hist_name).clear()
             strategy.best_accuracy = 0.0
             run_sequential(build_numpy_client, strategy, args.num_clients, args.num_rounds)
 
@@ -691,59 +670,88 @@ def main(
     print("   - Cada comunicación transmite solo las CNN-1D + capas densas.")
     print("=" * 50)
 
-    # Visualización de Resultados
+    # Guardar el modelo global final (solo los ~1M parámetros entrenables; los backbones están congelados)
+    if strategy.final_ndarrays is not None:
+        model_path = os.path.splitext(args.output_csv)[0] + "_modelo_global.npz"
+        try:
+            np.savez(model_path, *strategy.final_ndarrays)
+            print(f"\n[INFO] Modelo global final guardado en: {model_path}")
+        except Exception as e:
+            print(f"[WARN] No se pudo guardar el modelo global: {e}")
+
+    # Tabla de métricas por ronda (alineada al largo de la accuracy; si falta algún dato queda NaN)
     if strategy.history_accuracy:
-        has_eq = bool(getattr(strategy, "history_eq", None) and any(v > 0.0 for v in strategy.history_eq))
-        rounds = list(range(1, len(strategy.history_accuracy) + 1))
-        
-        if has_eq:
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-            # Subplot 1: Precisión Global
-            ax1.plot(rounds, strategy.history_accuracy, 'b-o', label='Precisión Global')
-            ax1.set_xlabel("Ronda de Comunicación")
-            ax1.set_ylabel("Precisión")
-            ax1.set_title("Evolución de la Precisión")
-            ax1.grid(True)
-            ax1.legend()
+        n_rounds_done = len(strategy.history_accuracy)
 
-            # Subplot 2: Calidad de Explicación (EQ)
-            eq_series = strategy.history_eq[:len(rounds)]
-            ax2.plot(rounds, eq_series, 'g-s', label='Explanation Quality (EQ)')
-            ax2.set_xlabel("Ronda de Comunicación")
-            ax2.set_ylabel("Calidad de Explicación (0.0 - 1.0)")
-            ax2.set_title("Calidad de Explicaciones (Precision in Important Features)")
-            ax2.set_ylim([-0.05, 1.05])
-            ax2.grid(True)
-            ax2.legend()
+        def _col(hist):
+            hist = list(hist)[:n_rounds_done]
+            return hist + [float("nan")] * (n_rounds_done - len(hist))
 
-            plt.tight_layout()
-            plt.savefig(args.output_plot)
-            print(f"\n[INFO] Gráfica de evolución guardada en: {args.output_plot}")
+        has_expl = any(v > 0.0 for v in strategy.history_eq)
+        data_dict = {
+            "Ronda de Comunicación": list(range(1, n_rounds_done + 1)),
+            "Precisión": _col(strategy.history_accuracy),
+            "Macro-F1": _col(strategy.history_macro_f1),
+        }
+        if has_expl:
+            data_dict.update({
+                "Calidad de Explicación (EQ)": _col(strategy.history_eq),
+                "EQ azar (referencia)": _col(strategy.history_eq_chance),
+                "EQ condicionada a predicción (control)": _col(strategy.history_eq_pred),
+                "Relevancia Semántica (SR)": _col(strategy.history_sr),
+                "Consistencia de Dominio (DC)": _col(strategy.history_dc),
+                "Diversidad Semántica (SD)": _col(strategy.history_sd),
+            })
+        df_metrics = pd.DataFrame(data_dict)
+        df_metrics.to_csv(args.output_csv, index=False)
+        print(f"[INFO] Tabla de métricas exportada a: {args.output_csv}")
+        print("\nResumen de métricas por ronda:")
+        print(df_metrics.round(4).to_string(index=False))
+
+        # Visualización de resultados
+        rounds = data_dict["Ronda de Comunicación"]
+        if has_expl:
+            fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+            (ax1, ax2), (ax3, ax4) = axes
+
+            ax1.plot(rounds, data_dict["Precisión"], 'b-o', label='Accuracy')
+            ax1.plot(rounds, data_dict["Macro-F1"], 'c-^', label='Macro-F1')
+            ax1.set_title("Rendimiento predictivo")
+            ax1.set_ylabel("Valor")
+
+            ax2.plot(rounds, data_dict["Calidad de Explicación (EQ)"], 'g-s', label='EQ (independiente de la predicción)')
+            ax2.plot(rounds, data_dict["EQ condicionada a predicción (control)"], 'g:', alpha=0.7, label='EQ condicionada a la predicción (control)')
+            ax2.plot(rounds, data_dict["EQ azar (referencia)"], 'k--', label='Azar')
+            ax2.set_title("Explanation Quality (precisión en criterios DSM-5)")
+            ax2.set_ylabel("EQ [0-1]")
+            ax2.set_ylim([-0.02, 1.02])
+
+            ax3.plot(rounds, data_dict["Relevancia Semántica (SR)"], 'm-o', label='SR')
+            ax3.plot(rounds, data_dict["Consistencia de Dominio (DC)"], 'r-s', label='DC')
+            ax3.set_title("Relevancia Semántica y Consistencia de Dominio")
+            ax3.set_ylabel("Valor [0-1]")
+            ax3.set_ylim([-0.02, 1.02])
+
+            ax4.plot(rounds, data_dict["Diversidad Semántica (SD)"], 'y-o', label='SD')
+            ax4.set_title("Diversidad Semántica entre clientes")
+            ax4.set_ylabel("SD [0-1]")
+
+            for ax in (ax1, ax2, ax3, ax4):
+                ax.set_xlabel("Ronda de Comunicación")
+                ax.grid(True)
+                ax.legend()
         else:
             plt.figure(figsize=(10, 5))
-            plt.plot(rounds, strategy.history_accuracy, 'b-o', label='Precisión Promedio')
+            plt.plot(rounds, data_dict["Precisión"], 'b-o', label='Accuracy')
+            plt.plot(rounds, data_dict["Macro-F1"], 'c-^', label='Macro-F1')
             plt.xlabel("Ronda de Comunicación")
-            plt.ylabel("Precisión")
+            plt.ylabel("Valor")
             plt.title("Evolución del Rendimiento")
             plt.grid(True)
             plt.legend()
-            plt.tight_layout()
-            plt.savefig(args.output_plot)
-            print(f"\n[INFO] Gráfica de evolución guardada en: {args.output_plot}")
-
-    # Exportación de métricas a CSV
-    if strategy.history_accuracy:
-        data_dict = {
-            "Ronda de Comunicación": list(range(1, len(strategy.history_accuracy) + 1)),
-            "Precisión": strategy.history_accuracy
-        }
-        if getattr(strategy, "history_eq", None) and any(v > 0.0 for v in strategy.history_eq):
-            data_dict["Calidad de Explicación (EQ)"] = strategy.history_eq[:len(strategy.history_accuracy)]
-        df_precision = pd.DataFrame(data_dict)
-        df_precision.to_csv(args.output_csv, index=False)
-        print(f"[INFO] Tabla de métricas exportada a: {args.output_csv}")
-        print("\nResumen de métricas por ronda:")
-        print(df_precision.to_string(index=False))
+        plt.tight_layout()
+        plt.savefig(args.output_plot)
+        print(f"[INFO] Gráfica de evolución guardada en: {args.output_plot}")
 
 
 if __name__ == "__main__":

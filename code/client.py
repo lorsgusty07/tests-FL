@@ -287,7 +287,7 @@ class FlowerClient(fl.client.NumPyClient):
                     all_sent.append(sent)
                     all_labels.append(labels)
                     count += len(labels)
-                    if count >= 64:
+                    if count >= 128:
                         break
             if all_z:
                 cat_z = torch.cat(all_z, dim=0)
@@ -306,7 +306,9 @@ class FlowerClient(fl.client.NumPyClient):
         sr_val = float(sem_metrics.get("semantic_relevance", 0.0))
         dc_val = float(sem_metrics.get("domain_consistency", 0.0))
         eq_val = float(sem_metrics.get("explanation_quality", 0.0))
-        _diag(f"cliente {self.cid}: fit() fin (acc={accuracy:.2%}, EQ={eq_val:.3f}, SR={sr_val:.3f}, DC={dc_val:.3f})")
+        eq_chance = float(sem_metrics.get("explanation_chance", 0.0))
+        eq_pred = float(sem_metrics.get("explanation_quality_pred", 0.0))
+        _diag(f"cliente {self.cid}: fit() fin (acc={accuracy:.2%}, EQ={eq_val:.3f} [azar={eq_chance:.3f}, EQ_pred={eq_pred:.3f}], SR={sr_val:.3f}, DC={dc_val:.3f})")
 
         # Flower solo acepta en `metrics` valores escalares (int | float | str | bytes | bool).
         # Todo array/lista se serializa como JSON string para que Flower/Ray no rechace los resultados de fit.
@@ -316,6 +318,8 @@ class FlowerClient(fl.client.NumPyClient):
             "semantic_relevance": sr_val,
             "domain_consistency": dc_val,
             "explanation_quality": eq_val,
+            "explanation_chance": eq_chance,
+            "explanation_quality_pred": eq_pred,
         }
         exp_vec = sem_metrics.get("explanation_vector")
         if exp_vec is not None and len(exp_vec) > 0:
@@ -337,6 +341,8 @@ class FlowerClient(fl.client.NumPyClient):
 
         correct, total, loss = 0, 0, 0.0
         pred_counts = torch.zeros(len(self.classes), dtype=torch.long)
+        n_cls = len(self.classes)
+        confusion = torch.zeros(n_cls, n_cls, dtype=torch.long)   # filas = clase real, columnas = predicha
         with torch.no_grad():
             for texts, labels in self.valloader:
                 texts, labels = texts.to(self.device), labels.to(self.device)
@@ -345,7 +351,10 @@ class FlowerClient(fl.client.NumPyClient):
                 total += labels.size(0)
                 preds = outputs.argmax(1)
                 correct += (preds == labels).sum().item()
-                pred_counts += torch.bincount(preds.cpu(), minlength=len(self.classes))
+                pred_counts += torch.bincount(preds.cpu(), minlength=n_cls)
+                confusion += torch.bincount(
+                    labels.cpu() * n_cls + preds.cpu(), minlength=n_cls * n_cls
+                ).reshape(n_cls, n_cls)
 
         # Diagnóstico de colapso: si el modelo predice casi siempre una sola clase,
         # su accuracy coincide con la proporción de la clase mayoritaria (baseline).
@@ -361,7 +370,10 @@ class FlowerClient(fl.client.NumPyClient):
             torch.cuda.empty_cache()
 
         accuracy = correct / total if total > 0 else 0.0
-        return float(loss / total), total, {"accuracy": accuracy}
+        return float(loss / total), total, {
+            "accuracy": accuracy,
+            "confusion_json": json.dumps(confusion.tolist()),
+        }
 
     def _diag_data_sanity(self):
         """Verifica que los IDs del .npz se decodifican a texto real antes de llegar a MentalBERT/MelBERT."""
