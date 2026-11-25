@@ -541,7 +541,7 @@ def main(
 
     client_resources = {
         "num_cpus": 1,
-        "num_gpus": 1.0 if torch.cuda.is_available() else 0.0
+        "num_gpus": 0.5 if torch.cuda.is_available() else 0.0
     }
 
     def build_numpy_client(cid: int):

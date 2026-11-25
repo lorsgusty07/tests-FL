@@ -16,8 +16,11 @@ venv.bak/
 
 # Datasets
 dataset/*
+ontologias/*
 !dataset/.gitkeep
 fedavg_15r.csv
 fedavg_15r.png
 semfedxai_15r.csv
 semfedxai_15r.png
+tex/
+*.tex
