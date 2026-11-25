@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import faulthandler
 import numpy as np
 import torch
@@ -11,9 +12,11 @@ import flwr as fl
 
 from model import (
     TextDataset,
+    HybridTokenizedDataset,
     CNNTextClassifier,
     HybridTransformerClassifier,
     make_collate_fn,
+    make_hybrid_collate_fn,
     extract_itos,
 )
 from semantic_modules import (
@@ -28,6 +31,15 @@ try:
     faulthandler.enable(file=sys.stderr, all_threads=True)
 except Exception:
     pass
+
+
+# Caché a nivel de proceso de los .npz y de las secuencias ya tokenizadas de cada cliente.
+# Flower crea un FlowerClient nuevo en cada fit/evaluate; con esto:
+#   - el .npz se lee desde Google Drive 1 sola vez por proceso, y
+#   - ids_to_texts + mental_tokenizer + mel_tokenizer se ejecutan 1 sola vez por proceso/cliente
+#     en lugar de repetirse en cada batch de las N rondas.
+_PROCESS_DATA_CACHE = {}
+_PROCESS_TOKENIZED_CACHE = {}
 
 
 def _diag(msg: str):
@@ -70,15 +82,18 @@ class FlowerClient(fl.client.NumPyClient):
         knowledge_base: DSM5KnowledgeBase = None,
         lambda_onto: float = 0.1,
         local_epochs: int = 1,
-        lr: float = 1e-4
+        lr: float = 1e-4,
+        use_amp: bool = False
     ):
         self.cid = int(cid)
+        self.use_amp = bool(use_amp)
         self.vocab = vocab
         self.classes = classes
         self.data_dir = data_dir
         self.model_type = model_type
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.pad_idx = vocab['<pad>'] if '<pad>' in vocab else 0
+        self.max_seq_len = int(max_seq_len)
         self.use_semfedxai = use_semfedxai
         self.local_epochs = int(local_epochs) if local_epochs and local_epochs > 0 else 1
         self.lr = float(lr) if lr and lr > 0 else 1e-4
@@ -89,14 +104,15 @@ class FlowerClient(fl.client.NumPyClient):
             self.batch_size = 8 if model_type == "hybrid" else 32
 
         self.collate_fn = make_collate_fn(self.pad_idx)
-        self.trainloader, self.valloader = self.load_data()
+        raw_texts, labels, train_idx, val_idx, cache_key = self._prepare_splits()
 
         # Determinar el tamaño de vocabulario necesario para evitar IndexError
         if vocab_size is not None and vocab_size > 0:
             self.vocab_size = vocab_size
         else:
             max_tok = 0
-            for seq, _ in self.trainloader.dataset:
+            for i in train_idx:
+                seq = raw_texts[i]
                 if len(seq) > 0:
                     m = int(seq.max())
                     if m > max_tok:
@@ -110,7 +126,7 @@ class FlowerClient(fl.client.NumPyClient):
             self.model = HybridTransformerClassifier(
                 num_classes=len(self.classes),
                 freeze_transformers=freeze_transformers,
-                max_seq_len=max_seq_len,
+                max_seq_len=self.max_seq_len,
                 vocab_itos=vocab_itos,
                 pad_idx=self.pad_idx,
                 mental_model=shared_models.get("mental_model") if shared_models else None,
@@ -121,12 +137,23 @@ class FlowerClient(fl.client.NumPyClient):
             )
             _diag(f"cliente {self.cid}: backbones cargados en CPU; moviendo a {self.device}...")
             self.model = self.model.to(self.device)
-            _diag(f"cliente {self.cid}: modelo en {self.device}")
+            self.model.use_amp = self.use_amp
+            if self.use_amp and self.device.type == "cuda":
+                # TF32 en los productos de matrices restantes (GPUs Ampere o más nuevas)
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            _diag(f"cliente {self.cid}: modelo en {self.device} (amp={'on' if self.use_amp else 'off'})")
+
+            self.trainloader, self.valloader = self._build_hybrid_loaders(
+                raw_texts, labels, train_idx, val_idx, cache_key
+            )
 
             trainable_params = [p for p in self.model.parameters() if p.requires_grad]
             self.optimizer = optim.Adam(trainable_params, lr=self.lr)
-            self._diag_data_sanity()
         else:
+            self.trainloader, self.valloader = self._build_raw_loaders(
+                raw_texts, labels, train_idx, val_idx
+            )
             self.model = CNNTextClassifier(
                 vocab_size=self.vocab_size,
                 num_classes=len(self.classes),
@@ -174,13 +201,17 @@ class FlowerClient(fl.client.NumPyClient):
         # Si no se encuentra, devuelve la primera ruta esperada para lanzar el FileNotFoundError
         return possible_paths[0]
 
-    def load_data(self):
+    def _prepare_splits(self):
         file_path = self._resolve_client_data_path()
-        data = np.load(file_path, allow_pickle=True)
-
-        # Conversión robusta
-        texts = [torch.tensor(seq.astype(np.int64)) for seq in data['texts']]
-        labels = torch.tensor(data['labels'].astype(np.int64))
+        cache_key = os.path.abspath(file_path)
+        if cache_key not in _PROCESS_DATA_CACHE:
+            data = np.load(file_path, allow_pickle=True)
+            # Conversión robusta
+            _PROCESS_DATA_CACHE[cache_key] = (
+                [torch.tensor(seq.astype(np.int64)) for seq in data['texts']],
+                torch.tensor(data['labels'].astype(np.int64)),
+            )
+        texts, labels = _PROCESS_DATA_CACHE[cache_key]
 
         # División 80-20 ESTRATIFICADA y barajada con semilla fija.
         # Antes se cortaba por posición (texts[:80%]); si el .npz está agrupado por clase,
@@ -199,7 +230,9 @@ class FlowerClient(fl.client.NumPyClient):
         self.label_order_runs = int(np.sum(labels_np[1:] != labels_np[:-1])) if len(labels_np) > 1 else 0
         self.train_label_counts = np.bincount(labels_np[train_idx], minlength=len(self.classes))
         self.val_label_counts = np.bincount(labels_np[val_idx], minlength=len(self.classes)) if val_idx else np.zeros(len(self.classes), dtype=int)
+        return texts, labels, train_idx, val_idx, cache_key
 
+    def _build_raw_loaders(self, texts, labels, train_idx, val_idx):
         return (
             DataLoader(
                 TextDataset([texts[i] for i in train_idx], labels[train_idx]),
@@ -214,6 +247,74 @@ class FlowerClient(fl.client.NumPyClient):
                 collate_fn=self.collate_fn
             )
         )
+
+    def _build_hybrid_loaders(self, raw_texts, labels, train_idx, val_idx, cache_key):
+        """
+        Pre-tokeniza todas las muestras del cliente 1 sola vez por proceso y las guarda en RAM.
+        En rondas siguientes omite ids_to_texts y ambos tokenizadores en CPU.
+        """
+        itos = getattr(self.model, "vocab_itos", None)
+        if not itos:
+            self._diag_data_sanity_raw([raw_texts[i] for i in train_idx], labels[train_idx])
+            return self._build_raw_loaders(raw_texts, labels, train_idx, val_idx)
+
+        tok_key = (cache_key, self.max_seq_len)
+        if tok_key not in _PROCESS_TOKENIZED_CACHE:
+            self._diag_data_sanity_raw([raw_texts[i] for i in train_idx], labels[train_idx])
+            try:
+                t_tok = time.perf_counter()
+                all_strs = self.model.ids_to_texts(raw_texts)
+                m_ids_all, r_ids_all = [], []
+                for start in range(0, len(all_strs), 1024):
+                    chunk = all_strs[start:start + 1024]
+                    m_enc = self.model.mental_tokenizer(
+                        chunk, padding=False, truncation=True, max_length=self.max_seq_len
+                    )["input_ids"]
+                    r_enc = self.model.mel_tokenizer(
+                        chunk, padding=False, truncation=True, max_length=self.max_seq_len
+                    )["input_ids"]
+                    m_ids_all.extend(torch.tensor(s, dtype=torch.int32) for s in m_enc)
+                    r_ids_all.extend(torch.tensor(s, dtype=torch.int32) for s in r_enc)
+                _PROCESS_TOKENIZED_CACHE[tok_key] = (m_ids_all, r_ids_all)
+                _diag(
+                    f"cliente {self.cid}: {len(all_strs)} textos pre-tokenizados en caché RAM "
+                    f"en {time.perf_counter() - t_tok:.2f}s"
+                )
+            except Exception as e:
+                _diag(f"cliente {self.cid}: pre-tokenización no disponible ({e}); usando modo dinámico")
+                return self._build_raw_loaders(raw_texts, labels, train_idx, val_idx)
+
+        m_ids_all, r_ids_all = _PROCESS_TOKENIZED_CACHE[tok_key]
+        m_pad = 0 if getattr(self.model.mental_tokenizer, "pad_token_id", None) is None else int(self.model.mental_tokenizer.pad_token_id)
+        r_pad = 1 if getattr(self.model.mel_tokenizer, "pad_token_id", None) is None else int(self.model.mel_tokenizer.pad_token_id)
+        hybrid_collate = make_hybrid_collate_fn(m_pad, r_pad)
+
+        return (
+            DataLoader(
+                HybridTokenizedDataset(
+                    [m_ids_all[i] for i in train_idx],
+                    [r_ids_all[i] for i in train_idx],
+                    labels[train_idx],
+                ),
+                batch_size=self.batch_size,
+                shuffle=True,
+                collate_fn=hybrid_collate,
+            ),
+            DataLoader(
+                HybridTokenizedDataset(
+                    [m_ids_all[i] for i in val_idx],
+                    [r_ids_all[i] for i in val_idx],
+                    labels[val_idx],
+                ),
+                batch_size=self.batch_size,
+                shuffle=False,
+                collate_fn=hybrid_collate,
+            ),
+        )
+
+    def load_data(self):
+        texts, labels, train_idx, val_idx, _ = self._prepare_splits()
+        return self._build_raw_loaders(texts, labels, train_idx, val_idx)
 
     def get_parameters(self, config=None):
         if hasattr(self.model, "freeze_transformers") and self.model.freeze_transformers:
@@ -233,6 +334,7 @@ class FlowerClient(fl.client.NumPyClient):
             return self.get_parameters({}), 0, {"accuracy": 0.0, "failed": True}
 
         self.set_parameters(parameters)
+        t_start = time.perf_counter()
         _diag(f"cliente {self.cid}: fit() inicio ({len(self.trainloader.dataset)} muestras, batch={self.batch_size}, epochs={self.local_epochs})")
 
         max_batches = config.get("max_batches") if config else None
@@ -308,7 +410,7 @@ class FlowerClient(fl.client.NumPyClient):
         eq_val = float(sem_metrics.get("explanation_quality", 0.0))
         eq_chance = float(sem_metrics.get("explanation_chance", 0.0))
         eq_pred = float(sem_metrics.get("explanation_quality_pred", 0.0))
-        _diag(f"cliente {self.cid}: fit() fin (acc={accuracy:.2%}, EQ={eq_val:.3f} [azar={eq_chance:.3f}, EQ_pred={eq_pred:.3f}], SR={sr_val:.3f}, DC={dc_val:.3f})")
+        _diag(f"cliente {self.cid}: fit() fin en {time.perf_counter() - t_start:.1f}s (acc={accuracy:.2%}, EQ={eq_val:.3f} [azar={eq_chance:.3f}, EQ_pred={eq_pred:.3f}], SR={sr_val:.3f}, DC={dc_val:.3f})")
 
         # Flower solo acepta en `metrics` valores escalares (int | float | str | bytes | bool).
         # Todo array/lista se serializa como JSON string para que Flower/Ray no rechace los resultados de fit.
@@ -338,6 +440,7 @@ class FlowerClient(fl.client.NumPyClient):
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         self.model.eval()
+        t_start = time.perf_counter()
 
         correct, total, loss = 0, 0, 0.0
         pred_counts = torch.zeros(len(self.classes), dtype=torch.long)
@@ -362,7 +465,7 @@ class FlowerClient(fl.client.NumPyClient):
             top = int(pred_counts.argmax())
             baseline = float(self.val_label_counts.max()) / max(int(self.val_label_counts.sum()), 1)
             _diag(
-                f"cliente {self.cid}: eval acc={correct / total:.2%} | baseline_mayoritaria={baseline:.2%} | "
+                f"cliente {self.cid}: eval en {time.perf_counter() - t_start:.1f}s acc={correct / total:.2%} | baseline_mayoritaria={baseline:.2%} | "
                 f"clase_predicha_dominante={self.classes[top]} ({pred_counts[top].item() / total:.0%} de las predicciones)"
             )
 
@@ -375,18 +478,17 @@ class FlowerClient(fl.client.NumPyClient):
             "confusion_json": json.dumps(confusion.tolist()),
         }
 
-    def _diag_data_sanity(self):
+    def _diag_data_sanity_raw(self, sample_texts, sample_labels):
         """Verifica que los IDs del .npz se decodifican a texto real antes de llegar a MentalBERT/MelBERT."""
         try:
-            ds = self.trainloader.dataset
-            n_check = min(200, len(ds))
+            n_check = min(200, len(sample_texts))
             itos = getattr(self.model, "vocab_itos", None)
             if not itos or n_check == 0:
                 _diag(f"cliente {self.cid}: [SANITY] sin vocab_itos: los IDs NO se decodifican a texto (entrada inválida para BERT)")
                 return
-            texts = self.model.ids_to_texts([ds.texts[i] for i in range(n_check)])
+            texts = self.model.ids_to_texts(sample_texts[:n_check])
             n_empty = sum(1 for t in texts if t == "empty")
-            all_ids = torch.cat([ds.texts[i] for i in range(n_check)])
+            all_ids = torch.cat(sample_texts[:n_check])
             oov = float((all_ids >= len(itos)).float().mean()) if all_ids.numel() else 0.0
             names = [str(c) for c in self.classes]
             tr = dict(zip(names, self.train_label_counts.tolist()))
@@ -396,7 +498,7 @@ class FlowerClient(fl.client.NumPyClient):
                 f"cambios de etiqueta en el .npz={self.label_order_runs}"
             )
             _diag(f"cliente {self.cid}: [SANITY] train={tr} | val={va}")
-            _diag(f"cliente {self.cid}: [SANITY] ejemplo (label={names[int(ds.labels[0])]}): '{texts[0][:160]}'")
+            _diag(f"cliente {self.cid}: [SANITY] ejemplo (label={names[int(sample_labels[0])]}): '{texts[0][:160]}'")
         except Exception as e:
             _diag(f"cliente {self.cid}: [SANITY] no se pudo verificar ({e})")
 

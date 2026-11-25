@@ -355,6 +355,7 @@ def main(
     parser.add_argument("--model-type", type=str, choices=["hybrid", "cnn"], default="hybrid", help="Arquitectura del modelo ('hybrid' o 'cnn')")
     parser.add_argument("--no-freeze-transformers", action="store_true", help="No congelar las capas base de Transformers (por defecto están congeladas para eficiencia federada)")
     parser.add_argument("--max-seq-len", type=int, default=128, help="Longitud máxima de secuencia para los Transformers")
+    parser.add_argument("--amp", action="store_true", help="Precisión mixta (bfloat16/float16) solo en los Transformers congelados y TF32; acelera en GPU. Usar el mismo valor en FedAvg y SemFedXAI")
     parser.add_argument("--batch-size", type=int, default=None, help="Tamaño de batch por cliente (por defecto 8 para hybrid, 32 para cnn)")
     parser.add_argument("--hf-token", type=str, default=os.getenv("HF_TOKEN", None), help="Token de autenticación de Hugging Face para modelos gated")
     parser.add_argument("--simulate-failures", action="store_true", help="Habilitar simulación de fallos aleatorios")
@@ -399,6 +400,7 @@ def main(
     print("==================================================")
     print(" INICIANDO APRENDIZAJE FEDERADO ")
     print(f" ÉPOCAS LOCALES POR CLIENTE: {args.local_epochs}")
+    print(f" PRECISIÓN MIXTA (--amp): {'activada' if args.amp else 'desactivada'}")
     if args.strategy == "semfedxai":
         print(f" ESTRATEGIA: SemFedXAI (α={args.alpha}, β={args.beta}, γ={args.gamma}, λ_onto={args.lambda_onto})")
     else:
@@ -521,7 +523,8 @@ def main(
             knowledge_base=kb,
             lambda_onto=args.lambda_onto,
             local_epochs=args.local_epochs,
-            lr=args.lr
+            lr=args.lr,
+            use_amp=args.amp
         )
         return client.to_client() if hasattr(client, "to_client") else client
 
@@ -562,7 +565,8 @@ def main(
             knowledge_base=kb,
             lambda_onto=args.lambda_onto,
             local_epochs=args.local_epochs,
-            lr=args.lr
+            lr=args.lr,
+            use_amp=args.amp
         )
 
     # Modo hijo del preflight: ejecuta 1 cliente real (2 batches) y termina

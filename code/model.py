@@ -1,3 +1,4 @@
+import contextlib
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
@@ -23,6 +24,50 @@ def make_collate_fn(pad_idx: int):
         texts, labs = zip(*batch)
         padded = pad_sequence(texts, batch_first=True, padding_value=pad_idx)
         return padded.to(torch.long), torch.tensor(labs, dtype=torch.long)
+    return collate_fn
+
+
+class PreTokenizedBatch(dict):
+    """Lote ya tokenizado para MentalBERT y MelBERT, compatible con `.to(device)`."""
+    def to(self, device):
+        return PreTokenizedBatch({
+            branch: {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
+            for branch, inputs in self.items()
+        })
+
+
+class HybridTokenizedDataset(Dataset):
+    """Dataset en RAM con secuencias ya tokenizadas para MentalBERT y MelBERT."""
+    def __init__(self, mental_ids: list, mel_ids: list, labels: torch.Tensor):
+        self.mental_ids = mental_ids
+        self.mel_ids = mel_ids
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return self.mental_ids[idx], self.mel_ids[idx], self.labels[idx]
+
+
+def _pad_ids_and_mask(seqs, pad_id: int) -> dict:
+    lengths = torch.tensor([len(s) for s in seqs], dtype=torch.long)
+    padded = pad_sequence(seqs, batch_first=True, padding_value=pad_id).to(torch.long)
+    max_len = padded.size(1)
+    mask = (torch.arange(max_len, dtype=torch.long).unsqueeze(0) < lengths.unsqueeze(1)).to(torch.long)
+    return {"input_ids": padded, "attention_mask": mask}
+
+
+def make_hybrid_collate_fn(mental_pad_id: int = 0, mel_pad_id: int = 1):
+    """Rellena dinámicamente al largo máximo del lote sin reconstruir strings ni retokenizar."""
+    def collate_fn(batch):
+        m_seqs, r_seqs, labs = zip(*batch)
+        batch_inputs = PreTokenizedBatch({
+            "mental": _pad_ids_and_mask(m_seqs, mental_pad_id),
+            "mel": _pad_ids_and_mask(r_seqs, mel_pad_id),
+        })
+        labels = torch.stack(labs) if isinstance(labs[0], torch.Tensor) else torch.tensor(labs, dtype=torch.long)
+        return batch_inputs, labels.to(torch.long)
     return collate_fn
 
 
@@ -281,6 +326,8 @@ class HybridTransformerClassifier(nn.Module):
         self.vocab_itos = vocab_itos
         self.pad_idx = pad_idx
         self.hf_token = hf_token
+        # Precisión mixta para los transformers congelados (se activa con --amp desde el cliente)
+        self.use_amp = False
 
         # Si no se pasan modelos precargados, usar caché a nivel de proceso
         if mental_model is None or melbert_model is None:
@@ -339,8 +386,20 @@ class HybridTransformerClassifier(nn.Module):
         return texts
 
     def _prepare_inputs(self, x):
-        """Convierte entradas (textos o tensores de IDs) en inputs listos para MentalBERT y MelBERT."""
+        """Convierte entradas (lote pre-tokenizado, textos o tensores de IDs) en inputs listos para MentalBERT y MelBERT."""
         device = next(self.parameters()).device
+
+        # Caso 0: Lote pre-tokenizado {"mental": {...}, "mel": {...}} (cero trabajo de tokenización en CPU)
+        if isinstance(x, dict) and "mental" in x and "mel" in x:
+            mental_inputs = {
+                k: (v if v.device == device else v.to(device, non_blocking=True))
+                for k, v in x["mental"].items()
+            }
+            mel_inputs = {
+                k: (v if v.device == device else v.to(device, non_blocking=True))
+                for k, v in x["mel"].items()
+            }
+            return mental_inputs, mel_inputs
 
         # Caso 1: Lista de strings de texto
         if isinstance(x, (list, tuple)) and len(x) > 0 and isinstance(x[0], str):
@@ -397,14 +456,30 @@ class HybridTransformerClassifier(nn.Module):
         counts = mask.sum(dim=1).clamp(min=1e-9)
         return summed / counts
 
+    def _backbone_autocast(self, device):
+        """
+        Autocast SOLO para los transformers congelados (inferencia pura, sin gradientes).
+        bfloat16 en GPUs Ampere o más nuevas (L4, A100, H100); float16 en las anteriores (T4).
+        Las CNN-1D y la capa densa, que son lo que se entrena y se comunica, siguen en float32.
+        """
+        if not (self.use_amp and self.freeze_transformers and device.type == "cuda"):
+            return contextlib.nullcontext()
+        major, _ = torch.cuda.get_device_capability(device)
+        dtype = torch.bfloat16 if major >= 8 else torch.float16
+        return torch.autocast(device_type="cuda", dtype=dtype)
+
     def forward(self, x, return_features: bool = False):
         mental_inputs, mel_inputs = self._prepare_inputs(x)
 
         # Generar embeddings contextuales de 768 dimensiones
         if self.freeze_transformers:
-            with torch.no_grad():
-                emb_mental = self.mental_bert(**mental_inputs).last_hidden_state.detach()
-                emb_mel = self.melbert(**mel_inputs).last_hidden_state.detach()
+            device = mental_inputs["input_ids"].device
+            with torch.no_grad(), self._backbone_autocast(device):
+                emb_mental = self.mental_bert(**mental_inputs).last_hidden_state
+                emb_mel = self.melbert(**mel_inputs).last_hidden_state
+            # Volver a float32 antes de las capas entrenables (no-op si ya es float32)
+            emb_mental = emb_mental.detach().float()
+            emb_mel = emb_mel.detach().float()
         else:
             emb_mental = self.mental_bert(**mental_inputs).last_hidden_state
             emb_mel = self.melbert(**mel_inputs).last_hidden_state
